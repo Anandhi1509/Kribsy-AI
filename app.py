@@ -211,16 +211,35 @@ def db_save_score(payload: dict) -> bool:
 @st.cache_data(ttl=30)
 def load_topics() -> pd.DataFrame:
     data = db_get_topics()
+
+    # If DB empty → return safe structure
     if not data:
         return pd.DataFrame(columns=["Subject", "Topic", "Difficulty", "Status"])
 
-    df = pd.DataFrame(data).drop(columns=["_id"], errors="ignore")
+    df = pd.DataFrame(data)
 
-    if "Status" not in df.columns:
-        df["Status"] = Status.NOT_STARTED.value
+    # Remove Mongo ID safely
+    if "_id" in df.columns:
+        df = df.drop(columns=["_id"])
 
+    # 🔥 FORCE REQUIRED COLUMNS (MOST IMPORTANT FIX)
+    required_cols = ["Subject", "Topic", "Difficulty", "Status"]
+
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = "Unknown" if col != "Status" else Status.NOT_STARTED.value
+
+    # Clean NaN values
+    df["Subject"] = df["Subject"].fillna("Unknown")
+    df["Topic"] = df["Topic"].fillna("Unknown")
+    df["Difficulty"] = df["Difficulty"].fillna("Easy")
+    df["Status"] = df["Status"].fillna(Status.NOT_STARTED.value)
+
+    # Normalize status
     df["Status"] = df["Status"].apply(lambda v: normalize_status(v).value)
+
     return df
+
 
 
 @st.cache_data(ttl=30)
@@ -428,7 +447,7 @@ elif page == "Subjects":
     if topics_df.empty:
         st.warning("No subjects found. Add topics in Study Tracker first.")
     else:
-        for sub in sorted(topics_df["Subject"].dropna().unique()):
+        for sub in sorted(topics_df.get("Subject", pd.Series(["Unknown"])).dropna().unique()):
             sub_df   = topics_df[topics_df["Subject"] == sub]
             total_s  = len(sub_df)
             comp_s   = int((sub_df["Status"] == Status.COMPLETED.value).sum())
@@ -499,10 +518,10 @@ elif page == "Study Tracker":
     else:
         upd_sub = st.selectbox(
             "Filter by Subject",
-            sorted(topics_df["Subject"].dropna().unique()),
+            sorted(topics_df.get("Subject", pd.Series(["Unknown"])).dropna().unique()),
             key="upd_sub_sel",
         )
-        _filtered = topics_df[topics_df["Subject"] == upd_sub]
+        _filtered = topics_df[topics_df.get("Subject", "") == upd_sub]
         upd_top   = st.selectbox(
             "Select Topic",
             _filtered["Topic"].unique(),
@@ -529,7 +548,7 @@ elif page == "Study Tracker":
     if not topics_df.empty:
         del_sub = st.selectbox(
             "Subject (delete)",
-            sorted(topics_df["Subject"].dropna().unique()),
+            sorted(topics_df.get("Subject", pd.Series(["Unknown"])).dropna().unique()),
             key="del_sub_sel",
         )
         _del_filtered = topics_df[topics_df["Subject"] == del_sub]
@@ -846,7 +865,7 @@ elif page == "Report":
 
         # Topics per Subject
         safe_bar_chart(
-            topics_df["Subject"].fillna("Unknown").value_counts(),
+            topics_df.get("Subject", pd.Series(["Unknown"])).fillna("Unknown").value_counts(),
             ylabel="Topics",
             title="Topics per Subject",
         )

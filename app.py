@@ -6,6 +6,8 @@ import random
 from google import genai
 from pymongo import MongoClient
 
+os.makedirs("data", exist_ok=True)
+
 client = genai.Client(
     api_key=st.secrets["GEMINI_API_KEY"]
 )

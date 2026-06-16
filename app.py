@@ -213,7 +213,12 @@ def load_topics() -> pd.DataFrame:
     data = db_get_topics()
     if not data:
         return pd.DataFrame(columns=["Subject", "Topic", "Difficulty", "Status"])
+
     df = pd.DataFrame(data).drop(columns=["_id"], errors="ignore")
+
+    if "Status" not in df.columns:
+        df["Status"] = Status.NOT_STARTED.value
+
     df["Status"] = df["Status"].apply(lambda v: normalize_status(v).value)
     return df
 

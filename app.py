@@ -4,6 +4,7 @@ import pandas as pd
 import os
 import random
 from google import genai
+from pymongo import MongoClient
 
 client = genai.Client(
     api_key=st.secrets["GEMINI_API_KEY"]
@@ -13,6 +14,14 @@ MODELS = [
     "gemini-2.0-flash",
     "gemini-2.5-flash-lite"
 ]
+
+MONGO_URI = st.secrets["MONGO_URI"]
+
+mongo_client = MongoClient(MONGO_URI)
+
+db = mongo_client["kribsy"]
+
+topics_collection = db["topics"]
 def ask_gemini(prompt):
     for m in MODELS:
         try:

@@ -1,823 +1,920 @@
 
-import streamlit as st
+import json
+import re
+from datetime import datetime
+from enum import Enum
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import pandas as pd
-import os
-import random
+import streamlit as st
 from google import genai
 from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 
-os.makedirs("data", exist_ok=True)
+# ══════════════════════════════════════════════════════════════════
+# 1. CONSTANTS  – single source of truth; never use raw strings
+# ══════════════════════════════════════════════════════════════════
+class Status(str, Enum):
+    NOT_STARTED = "not started"
+    IN_PROGRESS = "in progress"
+    COMPLETED   = "completed"
 
-client = genai.Client(
-    api_key=st.secrets["GEMINI_API_KEY"]
-)
-MODELS = [
+SUBJECTS = [
+    "History", "Polity", "Economy",
+    "Geography", "Science", "Current Affairs",
+]
+DIFFICULTIES = ["Easy", "Medium", "Hard"]
+STATUS_LABELS = {
+    Status.NOT_STARTED: "⏳ Not Started",
+    Status.IN_PROGRESS: "🔄 In Progress",
+    Status.COMPLETED:   "✅ Completed",
+}
+STATUS_FROM_LABEL = {v: k for k, v in STATUS_LABELS.items()}
+
+GEMINI_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemini-2.5-flash-lite"
+    "gemini-2.5-flash-lite",
 ]
 
-MONGO_URI = st.secrets["MONGO_URI"]
+# ══════════════════════════════════════════════════════════════════
+# 2. HELPERS
+# ══════════════════════════════════════════════════════════════════
+def normalize_status(value) -> Status:
+    """
+    Convert any raw string → Status enum.
+    Unknown / None / empty → Status.NOT_STARTED.
+    """
+    raw = str(value).strip().lower() if value is not None else ""
+    for s in Status:
+        if s.value == raw:
+            return s
+    return Status.NOT_STARTED
 
-mongo_client = MongoClient(MONGO_URI)
 
-db = mongo_client["kribsy"]
-
-topics_collection = db["topics"]
-def ask_gemini(prompt):
-    for m in MODELS:
+def parse_ai_json(raw: str) -> list:
+    """
+    Robustly extract a JSON array from an AI response.
+    Strategy:
+      1. Strip markdown fences.
+      2. Try direct json.loads.
+      3. Fallback: regex for the first [...] block.
+      4. Validate each item has required keys.
+    Raises ValueError with a human-readable message on failure.
+    """
+    cleaned = (
+        raw.replace("```json", "")
+           .replace("```", "")
+           .strip()
+    )
+    # Try direct parse first (cleanest path)
+    for candidate in [cleaned]:
         try:
-            response = client.models.generate_content(
-                model=m,
-                contents=prompt
-            )
-            return response.text
-        except Exception:
-            continue
+            data = json.loads(candidate)
+            if isinstance(data, list):
+                return _validate_quiz_items(data)
+        except json.JSONDecodeError:
+            pass
 
+    # Fallback: extract first [...] block
+    match = re.search(r"\[.*?\]", cleaned, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group())
+            if isinstance(data, list):
+                return _validate_quiz_items(data)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"JSON inside [...] block is malformed: {e}")
+
+    raise ValueError("No valid JSON array found in the AI response.")
+
+
+def _validate_quiz_items(items: list) -> list:
+    required = {"question", "optionA", "optionB", "optionC", "optionD", "answer"}
+    valid = []
+    for i, item in enumerate(items):
+        missing = required - set(item.keys())
+        if missing:
+            st.warning(f"Question {i+1} skipped — missing fields: {missing}")
+            continue
+        # Normalize answer: strip + upper; default to "A" if invalid
+        ans = str(item.get("answer", "A")).strip().upper()
+        item["answer"] = ans if ans in ("A", "B", "C", "D") else "A"
+        item.setdefault("explanation", "No explanation provided.")
+        valid.append(item)
+    if not valid:
+        raise ValueError("All questions failed validation.")
+    return valid
+
+
+def safe_bar_chart(series: pd.Series, ylabel: str, title: str):
+    """Render a bar chart safely — never crashes on empty/zero data."""
+    if series.empty or series.sum() == 0:
+        st.info(f"No data available yet for: **{title}**")
+        return
+    fig, ax = plt.subplots(figsize=(7, 3))
+    series.plot(kind="bar", ax=ax, color="#4C72B0", edgecolor="white")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontsize=11)
+    max_val = int(series.max())
+    ax.set_ylim(0, max_val * 1.35 if max_val > 0 else 1)
+    for i, v in enumerate(series.values):
+        ax.text(i, v + max(max_val * 0.02, 0.1), str(v), ha="center", fontsize=8)
+    plt.xticks(rotation=30, ha="right", fontsize=8)
+    plt.tight_layout()
+    st.pyplot(fig, use_container_width=False)
+    plt.close(fig)
+
+
+# ══════════════════════════════════════════════════════════════════
+# 3. DATABASE LAYER  – all MongoDB in one place
+# ══════════════════════════════════════════════════════════════════
+@st.cache_resource
+def get_db():
+    """
+    Single cached MongoDB connection.
+    Raises and stops the app if the DB is unreachable.
+    """
+    try:
+        client = MongoClient(
+            st.secrets["MONGO_URI"],
+            serverSelectionTimeoutMS=5_000,
+        )
+        client.server_info()
+        db = client["kribsy"]
+        return {
+            "topics":    db["topics"],
+            "questions": db["questions"],
+            "scores":    db["quiz_scores"],
+        }
+    except PyMongoError as e:
+        st.error(f"❌ MongoDB connection failed: {e}")
+        st.stop()
+
+
+def db_run(operation, *args, **kwargs):
+    """
+    Wraps any MongoDB call with error handling.
+    Returns the result or None on failure.
+    """
+    try:
+        return operation(*args, **kwargs)
+    except PyMongoError as e:
+        st.error(f"Database error: {e}")
+        return None
+
+
+# ── Typed DB operations ───────────────────────────────────────────
+def db_get_topics() -> list:
+    return list(db_run(DB["topics"].find) or [])
+
+def db_get_questions() -> list:
+    return list(db_run(DB["questions"].find) or [])
+
+def db_get_scores() -> list:
+    return list(db_run(DB["scores"].find) or [])
+
+def db_insert_topic(subject: str, topic: str, difficulty: str) -> bool:
+    result = db_run(DB["topics"].insert_one, {
+        "Subject":    subject,
+        "Topic":      topic,
+        "Difficulty": difficulty,
+        "Status":     Status.NOT_STARTED.value,
+    })
+    return result is not None
+
+def db_topic_exists(subject: str, topic: str) -> bool:
+    return bool(db_run(DB["topics"].find_one, {"Subject": subject, "Topic": topic}))
+
+def db_update_status(subject: str, topic: str, status: Status) -> bool:
+    result = db_run(
+        DB["topics"].update_one,
+        {"Subject": subject, "Topic": topic},
+        {"$set": {"Status": status.value}},
+    )
+    return result is not None
+
+def db_delete_topic(subject: str, topic: str) -> bool:
+    result = db_run(DB["topics"].delete_one, {"Subject": subject, "Topic": topic})
+    return result is not None
+
+def db_save_score(payload: dict) -> bool:
+    result = db_run(DB["scores"].insert_one, {**payload, "date": datetime.now()})
+    return result is not None
+
+
+# ══════════════════════════════════════════════════════════════════
+# 4. DATA LOADERS  (cached DataFrames; cleared after writes)
+# ══════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=30)
+def load_topics() -> pd.DataFrame:
+    data = db_get_topics()
+    if not data:
+        return pd.DataFrame(columns=["Subject", "Topic", "Difficulty", "Status"])
+    df = pd.DataFrame(data).drop(columns=["_id"], errors="ignore")
+    df["Status"] = df["Status"].apply(lambda v: normalize_status(v).value)
+    return df
+
+
+@st.cache_data(ttl=30)
+def load_questions() -> pd.DataFrame:
+    data = db_get_questions()
+    if not data:
+        return pd.DataFrame(columns=[
+            "Subject", "Question",
+            "OptionA", "OptionB", "OptionC", "OptionD",
+            "Answer", "Explanation",
+        ])
+    df = pd.DataFrame(data).drop(columns=["_id"], errors="ignore")
+    df["Answer"] = (
+        df["Answer"].fillna("A").astype(str).str.strip().str.upper()
+    )
+    df["Explanation"] = df["Explanation"].fillna("No explanation available.")
+    return df
+
+
+def refresh_data():
+    """Clear cache and reload — call after any DB write."""
+    st.cache_data.clear()
+
+
+# ══════════════════════════════════════════════════════════════════
+# 5. UNIFIED SESSION STATE
+# All keys registered once at startup under a single namespace.
+# ══════════════════════════════════════════════════════════════════
+_SESSION_DEFAULTS = {
+    # Dashboard
+    "dash": {
+        "last_prompt": "",
+        "ai_error":    False,
+    },
+    # AI Quiz
+    "aiq": {
+        "questions":   [],
+        "index":       0,
+        "score":       0,
+        "score_saved": False,
+        "topic":       "",
+        "submitted":   False,   # tracks if current answer was submitted
+    },
+    # PYQ Quiz
+    "pyq": {
+        "data":        None,
+        "index":       0,
+        "score":       0,
+        "score_saved": False,
+        "subject":     "",
+        "submitted":   False,
+    },
+}
+
+def init_session():
+    """Initialise all session state groups exactly once."""
+    for group, defaults in _SESSION_DEFAULTS.items():
+        if group not in st.session_state:
+            st.session_state[group] = dict(defaults)
+        else:
+            # Fill any missing keys added in later versions
+            for k, v in defaults.items():
+                st.session_state[group].setdefault(k, v)
+
+def ss(group: str) -> dict:
+    """Shorthand accessor: ss('aiq')['index']"""
+    return st.session_state[group]
+
+def reset_aiq():
+    st.session_state["aiq"] = dict(_SESSION_DEFAULTS["aiq"])
+
+def reset_pyq():
+    st.session_state["pyq"] = dict(_SESSION_DEFAULTS["pyq"])
+
+
+# ══════════════════════════════════════════════════════════════════
+# 6. GEMINI CLIENT
+# ══════════════════════════════════════════════════════════════════
+@st.cache_resource
+def get_gemini():
+    return genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+
+
+def ask_gemini(prompt: str) -> str:
+    gemini = get_gemini()
+    for model in GEMINI_MODELS:
+        try:
+            resp = gemini.models.generate_content(model=model, contents=prompt)
+            return resp.text
+        except Exception as e:
+            print(f"[Gemini] {model} failed: {e}")
     return "All models are busy. Try again later."
 
-if "last_prompt" not in st.session_state:
-    st.session_state.last_prompt = ""
 
-file_path = "data/topics.csv"
+# ══════════════════════════════════════════════════════════════════
+# 7. APP BOOTSTRAP
+# ══════════════════════════════════════════════════════════════════
+st.set_page_config(page_title="TNPSC PrepAI", page_icon="📚", layout="wide")
 
-if os.path.exists(file_path):
-    try:
-        topics_df = pd.read_csv(file_path, sep="|")
+DB = get_db()          # cached connection
+init_session()         # unified state
 
-        topics_df.columns = topics_df.columns.str.strip()
+topics_df    = load_topics()
+questions_df = load_questions()
 
-        required_cols = ["Subject", "Topic", "Difficulty", "Status"]
 
-        for col in required_cols:
-            if col not in topics_df.columns:
-                topics_df[col] = ""
-
-        topics_df = topics_df[required_cols]
-
-        topics_df = topics_df.dropna(how="all")
-
-        topics_df["Subject"] = topics_df["Subject"].astype(str).str.strip()
-        topics_df["Topic"] = topics_df["Topic"].astype(str).str.strip()
-        topics_df["Difficulty"] = topics_df["Difficulty"].astype(str).str.strip()
-
-        topics_df["Status"] = (
-            topics_df["Status"]
-            .astype(str)
-            .str.strip()
-            .str.lower()
-            .str.replace(",", "")
-        )
-
-    except Exception as e:
-        st.error(f"CSV Load Error: {e}")
-        topics_df = pd.DataFrame(columns=["Subject", "Topic", "Difficulty", "Status"])
-
-else:
-    topics_df = pd.DataFrame(columns=["Subject", "Topic", "Difficulty", "Status"])
-
-if os.path.exists("data/questions.csv"):
-    questions_df = pd.read_csv("data/questions.csv", sep="|")
-else:
-    questions_df = pd.DataFrame(
-        columns=[
-            "Subject",
-            "Question",
-            "OptionA",
-            "OptionB",
-            "OptionC",
-            "OptionD",
-            "Answer",
-            "Explanation",
-        ]
-    )
-
-st.set_page_config(
-    page_title="TNPSC PrepAI",
-    page_icon="📚",
-    layout="wide"
-)
-
-st.title("📚 kribsy AI-TNPSC Smart Preparation Assistant")
-
+# ══════════════════════════════════════════════════════════════════
+# 8. SIDEBAR NAVIGATION
+# ══════════════════════════════════════════════════════════════════
 st.sidebar.title("Navigation")
-
 page = st.sidebar.radio(
     "Choose Page",
-    [
-        "Dashboard",
-        "Subjects",
-        "Study Tracker",
-        "Quiz",
-        "Report"
-    ]
+    ["Dashboard", "Subjects", "Study Tracker", "Quiz", "Report"],
 )
 
+
+# ══════════════════════════════════════════════════════════════════
+# PAGE: DASHBOARD
+# ══════════════════════════════════════════════════════════════════
 if page == "Dashboard":
 
-    st.header("Kribsy AI Dashboard")
-
-    st.info("""
-    Kribsy AI is an AI-powered TNPSC preparation assistant
-    that helps students track topics, generate quizzes,
-    practice similar PYQs, and learn concepts using AI.
-    """)
-
-    total_topics = len(topics_df)
-    Completed_topics = len(
-        topics_df[
-            topics_df["Status"].astype(str).str.strip().str.lower() == "Completed"
-            ]
-    )
-    subjects_studied = topics_df["Subject"].nunique() if not topics_df.empty else 0
-
-    if total_topics == 0:
-        progress = 0
-    else:
-        progress = Completed_topics / total_topics
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric(
-        "Subjects Studied",
-        subjects_studied
+    st.title("📚 Kribsy AI – TNPSC Smart Preparation Assistant")
+    st.info(
+        "AI-powered TNPSC preparation: track topics, generate quizzes, "
+        "practice PYQs, and get AI explanations — all in one place."
     )
 
-    col2.metric(
-        "Topics Studied",
-        total_topics
-    )
+    # ── Metrics ───────────────────────────────────────────────────
+    total     = len(topics_df)
+    completed = int((topics_df["Status"] == Status.COMPLETED.value).sum()) if not topics_df.empty else 0
+    subjects  = topics_df["Subject"].nunique() if not topics_df.empty else 0
+    ratio     = completed / total if total > 0 else 0.0
 
-    col3.metric(
-        "Completed Topics",
-        Completed_topics
-    )
-
-    col4.metric(
-        "completion Rate",
-        f"{round(progress * 100, 1)}%"
-    )
-
-
-    st.progress(progress)
-    st.write(f"Progress: {round(progress * 100, 2)}%")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Subjects Studied",  subjects)
+    c2.metric("Topics Added",      total)
+    c3.metric("Completed Topics",  completed)
+    c4.metric("Completion Rate",   f"{round(ratio * 100, 1)}%")
+    st.progress(ratio)
 
     st.divider()
 
-    st.subheader("Kribsy AI")
+    # ── AI Topic Explainer ────────────────────────────────────────
+    st.subheader("🤖 AI Topic Explainer")
 
-    topic = st.text_input("Enter topic to explain", key="topic_input_main")
+    _dash = ss("dash")
+    topic_input = st.text_input("Enter a topic to explain", key="dash_topic_input")
 
-    # initialize memory once
+    col_btn1, col_btn2 = st.columns([1, 1])
+    with col_btn1:
+        if st.button("💡 Explain Topic", key="dash_explain_btn"):
+            if not topic_input.strip():
+                st.warning("Please enter a topic first.")
+            else:
+                _dash["last_prompt"] = topic_input.strip()
+                _dash["ai_error"]    = False
 
-    if "ai_error" not in st.session_state:
-        st.session_state.ai_error = False
+    with col_btn2:
+        if _dash["ai_error"]:
+            if st.button("🔁 Retry", key="dash_retry_btn"):
+                _dash["ai_error"] = False
+                # Keep last_prompt so it re-runs automatically below
+                st.rerun()
 
-    # Step 1: Button stores input
-    if st.button("Explain topic"):
-        if topic.strip() == "":
-            st.warning("Please enter a topic first")
-        else:
-            st.session_state.last_prompt = topic
-            st.session_state.ai_error = False
-
-    # Step 2: AI execution
-    if st.session_state.last_prompt:
-
-        try:
-            with st.spinner("AI is thinking..."):
-
-                # 🔥 YOUR EXACT PROMPT (UNCHANGED)
-                prompt = f"""
-        You are a TNPSC Group 1 expert faculty member.
-
+    if _dash["last_prompt"].strip():
+        with st.spinner("AI is thinking..."):
+            _prompt = f"""
+You are a TNPSC Group 1 expert faculty member.
 Explain the topic in a TNPSC-focused format.
 
 RULES:
+- Simple English, use bullet points, keep it exam-oriented.
+- Bold important TNPSC keywords.
+- Include Prelims AND Mains-relevant facts.
+- No long unnecessary paragraphs.
 
-- Use simple English.
-- Use bullet points wherever possible.
-- Keep each section precise and exam-oriented.
-- Highlight important TNPSC keywords in bold.
-- Include facts useful for Prelims and Mains.
-- Add current relevance wherever applicable.
-- Do NOT give unnecessary long paragraphs.
+SECTIONS TO COVER (use each as a heading):
+Introduction | Definition | Origin / History | Year / Timeline |
+Father / Founder / Important Personalities | Features |
+Classification / Types | Advantages / Importance | Disadvantages / Challenges |
+Real-Life Scenario | Case Study (India / Tamil Nadu) | Current Affairs Link |
+Government Schemes / Acts / Policies | TNPSC Important Facts |
+Prelims Quick Revision | Mains Answer Summary (5–8 Lines)
 
-FORMAT:
+TOPIC: {_dash["last_prompt"]}
+"""
+            _result = ask_gemini(_prompt)
 
-Introduction
+        if _result and "busy" not in _result.lower():
+            st.markdown(_result)
+            _dash["last_prompt"] = ""
+            _dash["ai_error"]    = False
+        else:
+            _dash["ai_error"] = True
+            st.error("AI is busy or failed. Click Retry above.")
 
-- Brief introduction of the topic.
 
-Definition
-
-- Clear definition.
-
-Origin / History
-
-- How and why it originated.
-
-Year / Timeline
-
-- Important years and chronology.
-
-Father / Founder / Important Personalities
-
-- Key persons associated with the topic.
-
-Features
-
-- Main characteristics.
-
-Classification / Types
-
-- Different types/categories (if applicable).
-
-Advantages / Importance
-
-- Key benefits and significance.
-
-Disadvantages / Challenges
-
-- Limitations and issues.
-
-Real-Life Scenario
-
-- Practical application in daily life.
-
-Case Study (India / Tamil Nadu)
-
-- One relevant example.
-
-Current Affairs Link
-
-- Recent developments related to the topic.
-
-Government Schemes / Acts / Policies
-
-- Related schemes, laws, commissions or programmes.
-
-TNPSC Important Facts
-
-- Important one-line facts.
-- Dates.
-- Committees.
-- Constitutional Articles.
-- Reports.
-- Statistics.
-
-Prelims Quick Revision
-
-- 5–10 important points for objective exams.
-
-Mains Answer Summary (5–8 Lines)
-
-- A ready-to-write TNPSC mains answer conclusion.
-
-TOPIC:
-{st.session_state.last_prompt}
-        """
-
-                result = ask_gemini(prompt)
-
-                if result and "busy" not in result.lower():
-                    st.markdown(result)
-                    st.session_state.last_prompt = ""
-                    st.session_state.ai_error = False
-                else:
-                    st.session_state.ai_error = True
-                    st.error("AI is busy or failed. Please retry.")
-
-        except Exception as e:
-            st.session_state.ai_error = True
-            st.error(f"Gemini Error: {e}")
-
-    # Step 3: Retry button (always visible when error happens)
-    if st.session_state.ai_error:
-        if st.button("🔁 Retry"):
-            st.rerun()
-
+# ══════════════════════════════════════════════════════════════════
+# PAGE: SUBJECTS
+# ══════════════════════════════════════════════════════════════════
 elif page == "Subjects":
 
     st.header("Subject Progress")
 
-    subjects = topics_df["Subject"].unique() if not topics_df.empty else []
-    if len(subjects) == 0:
-        st.warning("No subjects found. Add topics first.")
+    if topics_df.empty:
+        st.warning("No subjects found. Add topics in Study Tracker first.")
+    else:
+        for sub in sorted(topics_df["Subject"].dropna().unique()):
+            sub_df   = topics_df[topics_df["Subject"] == sub]
+            total_s  = len(sub_df)
+            comp_s   = int((sub_df["Status"] == Status.COMPLETED.value).sum())
+            prog_s   = int((sub_df["Status"] == Status.IN_PROGRESS.value).sum())
+            not_s    = total_s - comp_s - prog_s
+            ratio_s  = (comp_s + 0.5 * prog_s) / total_s if total_s > 0 else 0.0
 
-    for sub in subjects:
+            with st.expander(
+                f"**{sub}** — {round(ratio_s * 100, 1)}% complete", expanded=False
+            ):
+                st.progress(ratio_s)
+                ca, cb, cc = st.columns(3)
+                ca.metric("✅ Completed",   comp_s)
+                cb.metric("🔄 In Progress", prog_s)
+                cc.metric("⏳ Not Started", not_s)
 
-        subject_df = topics_df[topics_df["Subject"] == sub]
+                # Topic-level detail table
+                _display = sub_df[["Topic", "Difficulty", "Status"]].copy()
+                _display["Status"] = _display["Status"].apply(
+                    lambda v: STATUS_LABELS.get(normalize_status(v), v)
+                )
+                st.dataframe(_display, use_container_width=True, hide_index=True)
 
-        total = len(subject_df)
 
-        Completed = len(
-            subject_df[
-                subject_df["Status"].str.strip().str.lower() == "Completed"
-                ]
-        )
-
-        in_progress = len(
-            subject_df[
-                subject_df["Status"].str.strip().str.lower() == "in progress"
-                ]
-        )
-
-        progress = (
-                           Completed + (0.5 * in_progress)
-                   ) / total if total > 0 else 0
-
-        st.write(sub)
-
-        st.progress(progress)
-        st.write(f"{round(progress * 100, 1)}%")
-
+# ══════════════════════════════════════════════════════════════════
+# PAGE: STUDY TRACKER
+# ══════════════════════════════════════════════════════════════════
 elif page == "Study Tracker":
 
     st.header("Study Tracker")
 
-    subject = st.selectbox(
-        "Select Subject",
-        [
-            "History",
-            "Polity",
-            "Economy",
-            "Geography",
-            "Science",
-            "Current Affairs"
-        ]
-    )
+    # ── Add Topic ─────────────────────────────────────────────────
+    st.subheader("➕ Add New Topic")
 
-    topic = st.text_input("Topic Name")
+    add_sub  = st.selectbox("Subject",    SUBJECTS,     key="add_sub_sel")
+    add_top  = st.text_input("Topic Name",              key="add_top_inp")
+    add_diff = st.selectbox("Difficulty", DIFFICULTIES, key="add_diff_sel")
 
-    difficulty = st.selectbox(
-        "Difficulty",
-        [
-            "Easy",
-            "Medium",
-            "Hard"
-        ]
-    )
-
-    if st.button("Save Topic"):
-
-        new_data = pd.DataFrame({
-            "Subject": [subject],
-            "Topic": [topic],
-            "Difficulty": [difficulty],
-            "Status": ["Not Started"]
-        })
-
-        if os.path.exists(file_path):
-            existing = pd.read_csv(file_path, sep="|")
-
-            # REMOVE DUPLICATES BASED ON Subject + Topic
-            combined = pd.concat([existing, new_data], ignore_index=True)
-            combined = combined.drop_duplicates(subset=["Subject", "Topic"], keep="first")
-
-            combined.to_csv(file_path, index=False, sep="|")
+    if st.button("💾 Save Topic", key="save_topic_btn"):
+        if not add_top.strip():
+            st.warning("Topic name cannot be empty.")
+        elif db_topic_exists(add_sub, add_top.strip()):
+            st.warning("This topic already exists for the selected subject.")
         else:
-            new_data.to_csv(file_path, index=False, sep="|")
+            if db_insert_topic(add_sub, add_top.strip(), add_diff):
+                st.success(f"✅ Topic '{add_top.strip()}' saved under {add_sub}.")
+                refresh_data()
+                st.rerun()
+            else:
+                st.error("Failed to save topic. Check database connection.")
 
-        st.success(f"Topic '{topic}' saved successfully!")
-
-    if os.path.exists("data/topics.csv"):
-        saved_topics = pd.read_csv("data/topics.csv", sep="|")
+    # ── Saved Topics Table ────────────────────────────────────────
+    st.subheader("📋 Saved Topics")
+    if topics_df.empty:
+        st.info("No topics yet. Add one above.")
     else:
-        saved_topics = pd.DataFrame(columns=["Subject", "Topic", "Difficulty", "Status"])
-
-    st.subheader("Saved Topics")
-
-    st.dataframe(
-        saved_topics,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.subheader("Update Topic Status")
-
-    if saved_topics.empty:
-        st.warning("No topics available to update")
-        selected_topic = None
-    else:
-        selected_topic = st.selectbox(
-            "Select Topic to Update",
-            saved_topics["Topic"].unique()
+        _display_df = topics_df.copy()
+        _display_df["Status"] = _display_df["Status"].apply(
+            lambda v: STATUS_LABELS.get(normalize_status(v), v)
         )
+        st.dataframe(_display_df, use_container_width=True, hide_index=True)
 
-    new_status = st.selectbox(
-        "Change Status",
-        ["Not Started", "in progress", "Completed"]
-    )
+    # ── Update Status ─────────────────────────────────────────────
+    st.subheader("✏️ Update Topic Status")
 
-    if st.button("Update Status") and selected_topic is not None:
-        saved_topics.loc[
-            saved_topics["Topic"] == selected_topic,
-            "Status"
-        ] = new_status
+    if topics_df.empty:
+        st.warning("No topics to update.")
+    else:
+        upd_sub = st.selectbox(
+            "Filter by Subject",
+            sorted(topics_df["Subject"].dropna().unique()),
+            key="upd_sub_sel",
+        )
+        _filtered = topics_df[topics_df["Subject"] == upd_sub]
+        upd_top   = st.selectbox(
+            "Select Topic",
+            _filtered["Topic"].unique(),
+            key="upd_top_sel",
+        )
+        upd_label  = st.selectbox(
+            "New Status",
+            list(STATUS_LABELS.values()),
+            key="upd_status_sel",
+        )
+        upd_status = STATUS_FROM_LABEL[upd_label]
 
-        saved_topics.to_csv("data/topics.csv", index=False, sep="|")
+        if st.button("✅ Update Status", key="upd_status_btn"):
+            if db_update_status(upd_sub, upd_top, upd_status):
+                st.success(f"Status updated to '{upd_label}' for '{upd_top}'.")
+                refresh_data()
+                st.rerun()
+            else:
+                st.error("Update failed. Check database connection.")
 
-        st.success(f"Status updated to '{new_status}' for {selected_topic}")
+    # ── Delete Topic ──────────────────────────────────────────────
+    st.subheader("🗑 Delete Topic")
 
-    st.subheader("Delete Topic")
+    if not topics_df.empty:
+        del_sub = st.selectbox(
+            "Subject (delete)",
+            sorted(topics_df["Subject"].dropna().unique()),
+            key="del_sub_sel",
+        )
+        _del_filtered = topics_df[topics_df["Subject"] == del_sub]
+        del_top       = st.selectbox(
+            "Topic to Delete",
+            _del_filtered["Topic"].unique(),
+            key="del_top_sel",
+        )
+        del_confirm = st.checkbox("I confirm I want to permanently delete this topic", key="del_confirm")
 
-    confirm_delete = st.checkbox(
-        "I confirm deletion"
-    )
-
-    if selected_topic is not None:
-
-        if st.button("🗑 Delete Topic") and confirm_delete:
-            saved_topics = saved_topics[
-                saved_topics["Topic"] != selected_topic
-                ]
-
-            saved_topics.to_csv("data/topics.csv", index=False, sep="|")
-
-            st.success(
-                f"Topic '{selected_topic}' deleted successfully!"
-            )
-
-            st.rerun()
+        if st.button("🗑 Delete Topic", key="del_topic_btn"):
+            if not del_confirm:
+                st.warning("Tick the confirmation checkbox first.")
+            elif db_delete_topic(del_sub, del_top):
+                st.success(f"Topic '{del_top}' deleted.")
+                refresh_data()
+                st.rerun()
+            else:
+                st.error("Delete failed. Check database connection.")
 
 
+# ══════════════════════════════════════════════════════════════════
+# PAGE: QUIZ
+# ══════════════════════════════════════════════════════════════════
 elif page == "Quiz":
 
     st.header("TNPSC Quiz")
 
+    # ─────────────────────────────────────────────────────────────
+    # SECTION A: AI Quiz
+    # State namespace: ss("aiq")
+    # ─────────────────────────────────────────────────────────────
     st.subheader("🤖 AI Quiz Generator")
 
-    quiz_topic = st.text_input(
-        "Enter Quiz Topic",
-        key="ai_quiz_topic"
-    )
+    _aiq = ss("aiq")
 
-    num_questions = st.selectbox(
-        "Number of Questions",
-        [5, 10, 15, 20],
-        key="ai_quiz_count"
-    )
+    aiq_topic = st.text_input("Quiz Topic", key="aiq_topic_input")
+    aiq_num   = st.selectbox("Number of Questions", [5, 10, 15, 20], key="aiq_num_sel")
+    aiq_diff  = st.selectbox("Difficulty Level", DIFFICULTIES, key="aiq_diff_sel")
 
-    if st.button("Generate AI Quiz"):
-
-        if quiz_topic.strip() == "":
-            st.warning("Please enter a topic")
+    if st.button("🎯 Generate AI Quiz", key="aiq_generate_btn"):
+        if not aiq_topic.strip():
+            st.warning("Please enter a topic.")
         else:
+            _gen_prompt = f"""
+You are a TNPSC Group 1 question setter.
+Generate exactly {aiq_num} {aiq_diff}-level questions on: {aiq_topic.strip()}
 
-            with st.spinner("Generating TNPSC Quiz..."):
+Return ONLY a valid JSON array — no markdown, no extra text.
 
-                prompt = f"""
-                You are a TNPSC Group 1 question setter.
+Format:
+[
+  {{
+    "question": "...",
+    "optionA": "...",
+    "optionB": "...",
+    "optionC": "...",
+    "optionD": "...",
+    "answer": "A",
+    "explanation": "..."
+  }}
+]
 
-                Generate exactly {num_questions} questions on:
-
-                {quiz_topic}
-
-                Return ONLY valid JSON.
-
-                Format:
-
-                [
-                  {{
-                    "question":"Question text",
-                    "optionA":"OptionA",
-                    "optionB":"OptionB",
-                    "optionC":"OptionC",
-                    "optionD":"OptionD",
-                    "answer":"A",
-                    "explanation":"Explanation text"
-                  }}
-                ]
-
-                Rules:
-                - TNPSC Group 1 level
-                - 4 options
-                - One correct answer
-                - Detailed explanation
-                - Return JSON only
-                - Use double quotes only
-                - Do not use apostrophes inside JSON values
-                - Return JSON array only
-                """
-
-            import json
-            import re
-
-            result = ask_gemini(prompt)
-
-            cleaned = result.replace("```json", "").replace("```", "").strip()
+Rules:
+- TNPSC Group 1 exam style
+- One correct answer only (A / B / C / D)
+- Clear, detailed explanation per question
+- Use double quotes; no apostrophes inside values
+- Strictly return only the JSON array
+"""
+            with st.spinner("Generating quiz..."):
+                _raw = ask_gemini(_gen_prompt)
 
             try:
+                _questions = parse_ai_json(_raw)
+                reset_aiq()
+                _aiq = ss("aiq")
+                _aiq["questions"] = _questions
+                _aiq["topic"]     = aiq_topic.strip()
+                st.success(f"✅ {len(_questions)} questions generated!")
+            except ValueError as _ve:
+                st.error(f"Quiz generation failed: {_ve}")
+                with st.expander("Show raw AI response"):
+                    st.text(_raw)
 
-                match = re.search(r"\[.*\]", cleaned, re.DOTALL)
+    # ── AI Quiz Player ────────────────────────────────────────────
+    if _aiq["questions"]:
+        st.divider()
+        _qs  = _aiq["questions"]
+        _idx = _aiq["index"]
 
-                if match:
+        if _idx < len(_qs):
+            _q = _qs[_idx]
+            st.subheader(f"Question {_idx + 1} / {len(_qs)}")
+            st.progress((_idx + 1) / len(_qs))
+            st.markdown(f"**{_q['question']}**")
 
-                    json_text = match.group()
-
-                    quiz_data = json.loads(json_text)
-
-                    st.session_state.ai_quiz = quiz_data
-                    st.session_state.ai_quiz_index = 0
-                    st.session_state.ai_quiz_score = 0
-
-                    st.success("AI Quiz Generated Successfully ✅")
-
-                else:
-
-                    st.error("No valid JSON found")
-
-                    st.text_area(
-                        "AI Response",
-                        cleaned,
-                        height=400
-                    )
-
-            except Exception as e:
-
-                st.error(f"JSON Parse Error: {e}")
-
-                st.text_area(
-                    "AI Response",
-                    cleaned,
-                    height=400
-                )
-
-    st.divider()
-    if "ai_quiz" in st.session_state and st.session_state.ai_quiz:
-
-        quiz = st.session_state.ai_quiz
-        index = st.session_state.ai_quiz_index
-
-        if index < len(quiz):
-
-            q = quiz[index]
-
-            st.subheader(f"AI Question {index + 1}/{len(quiz)}")
-            st.progress((index + 1) / len(quiz))
-
-            st.write(q["question"])
-
-            options = [
-                q["optionA"],
-                q["optionB"],
-                q["optionC"],
-                q["optionD"]
-            ]
-
-            selected = st.radio(
-                "Choose Answer",
-                options,
-                key=f"ai_{index}"
+            _opts = {
+                "A": _q["optionA"],
+                "B": _q["optionB"],
+                "C": _q["optionC"],
+                "D": _q["optionD"],
+            }
+            # Key incorporates topic hash + index → unique across reruns
+            _radio_key = f"aiq_r_{abs(hash(_aiq['topic']))}_{_idx}"
+            _selected  = st.radio(
+                "Your answer:", list(_opts.values()), key=_radio_key
             )
 
-            if st.button("Submit AI Answer"):
+            _c1, _c2 = st.columns(2)
+            with _c1:
+                if st.button("✅ Submit", key=f"aiq_sub_{_idx}") and not _aiq["submitted"]:
+                    _correct = _opts[_q["answer"]]
+                    if _selected == _correct:
+                        st.success("Correct ✅")
+                        _aiq["score"] += 1
+                    else:
+                        st.error(f"Wrong ❌ — Correct: **{_correct}**")
+                    st.info(f"💡 {_q['explanation']}")
+                    _aiq["submitted"] = True
 
-                options_map = {
-                    "A": q["optionA"],
-                    "B": q["optionB"],
-                    "C": q["optionC"],
-                    "D": q["optionD"]
-                }
-
-                correct_option = options_map[q["answer"]]
-
-                if selected == correct_option:
-                    st.success("Correct ✅")
-                    st.session_state.ai_quiz_score += 1
-                else:
-                    st.error(f"Wrong ❌ Correct Answer: {correct_option}")
-
-                st.info(f"Explanation: {q['explanation']}")
-
-            if st.button("Next AI Question"):
-                st.session_state.ai_quiz_index += 1
-
-                st.rerun()
+            with _c2:
+                if st.button("Next ▶", key=f"aiq_nxt_{_idx}"):
+                    _aiq["index"]     += 1
+                    _aiq["submitted"]  = False
+                    st.rerun()
 
         else:
+            # ── AI Quiz Results ───────────────────────────────────
+            _sc  = _aiq["score"]
+            _tot = len(_qs)
+            _pct = round(_sc / _tot * 100, 2) if _tot else 0
 
-            st.success(
-                f"""
-    AI Quiz Completed!
+            st.success(f"🎉 Score: {_sc} / {_tot}  ({_pct}%)")
+            if _pct >= 80:   st.success("Excellent TNPSC Preparation 🔥")
+            elif _pct >= 60: st.info("Good Progress 👍")
+            else:            st.warning("Needs More Practice 📚")
 
-    Score:
-    {st.session_state.ai_quiz_score}
-    /
-    {len(quiz)}
-    """
-            )
+            if not _aiq["score_saved"]:
+                db_save_score({
+                    "type": "ai_quiz", "topic": _aiq["topic"],
+                    "score": _sc, "total": _tot, "percentage": _pct,
+                })
+                _aiq["score_saved"] = True
 
-            percentage = (
-                                 st.session_state.ai_quiz_score
-                                 / len(quiz)
-                         ) * 100
-
-            st.write(
-                f"Percentage: {round(percentage, 2)}%"
-            )
-
-            if percentage >= 80:
-                st.success("Excellent TNPSC Preparation 🔥")
-
-            elif percentage >= 60:
-                st.info("Good Progress 👍")
-
-            else:
-                st.warning("Needs More Practice 📚")
-
-            if st.button("Restart AI Quiz"):
-                del st.session_state.ai_quiz
-                st.session_state.ai_quiz_index = 0
-                st.session_state.ai_quiz_score = 0
-
+            if st.button("🔄 Restart AI Quiz", key="aiq_restart_btn"):
+                reset_aiq()
                 st.rerun()
 
+    # ─────────────────────────────────────────────────────────────
+    # SECTION B: PYQ Quiz
+    # State namespace: ss("pyq")
+    # Filtered by topics the student has studied (completed / in progress)
+    # with optional difficulty filter.
+    # ─────────────────────────────────────────────────────────────
     st.divider()
-
     st.subheader("📜 PYQ Quiz Generator")
 
-    st.write(
-            "Practice TNPSC Previous Year Questions with explanations and score tracking."
-        )
+    _pyq = ss("pyq")
 
     if questions_df.empty:
-        st.warning("No questions found in questions.csv")
+        st.warning("No PYQ questions found. Please add questions to the database.")
     else:
+        # Build studied-subjects set (case-insensitive, space-safe)
+        _studied = set()
+        if not topics_df.empty:
+            _studied = set(
+                topics_df[
+                    topics_df["Status"].isin([
+                        Status.COMPLETED.value, Status.IN_PROGRESS.value
+                    ])
+                ]["Subject"]
+                .dropna()
+                .str.strip()
+                .str.lower()
+            )
 
-        subject_list = questions_df["Subject"].dropna().unique()
+        _avail_subjects = sorted([
+            s for s in questions_df["Subject"].dropna().unique()
+            if (not _studied) or s.strip().lower() in _studied
+        ])
 
-        if len(subject_list) == 0:
-            st.warning("No subjects found in questions.csv")
-            st.stop()
+        if not _avail_subjects:
+            st.warning(
+                "No studied subjects with PYQs found. "
+                "Mark topics as In Progress or Completed first."
+            )
+        else:
+            pyq_sub  = st.selectbox("Subject", _avail_subjects, key="pyq_sub_sel")
+            pyq_diff = st.selectbox(
+                "Filter by Difficulty (optional)",
+                ["All"] + DIFFICULTIES,
+                key="pyq_diff_sel",
+            )
 
-        subject = st.selectbox("Choose Subject", subject_list)
+            # Reset state when subject changes
+            if pyq_sub != _pyq["subject"]:
+                reset_pyq()
+                _pyq = ss("pyq")
+                _pyq["subject"] = pyq_sub
 
-        subject_questions = questions_df[
-            questions_df["Subject"] == subject
-        ]
+            if st.button("▶ Start PYQ Quiz", key="pyq_start_btn"):
+                _pool = questions_df[questions_df["Subject"] == pyq_sub].copy()
 
-        if "quiz_index" not in st.session_state:
-            st.session_state.quiz_index = 0
-
-        if "quiz_score" not in st.session_state:
-            st.session_state.quiz_score = 0
-
-        if "quiz_data" not in st.session_state:
-            st.session_state.quiz_data = None
-
-        if st.button("Start Quiz"):
-
-            st.session_state.quiz_data = subject_questions.sample(
-                min(20, len(subject_questions))
-            ).reset_index(drop=True)
-
-            st.session_state.quiz_index = 0
-            st.session_state.quiz_score = 0
-
-            st.rerun()
-
-        if st.session_state.quiz_data is not None:
-
-            quiz = st.session_state.quiz_data
-            index = st.session_state.quiz_index
-
-            if index < len(quiz):
-
-                row = quiz.iloc[index]
-
-                st.subheader(
-                    f"Question {index + 1} / {len(quiz)}"
-                )
-
-                st.write(row["Question"])
-
-                options = [
-                    row["OptionA"],
-                    row["OptionB"],
-                    row["OptionC"],
-                    row["OptionD"]
-                ]
-
-                answer = st.radio(
-                    "Choose Answer",
-                    options,
-                    key=f"q{index}"
-                )
-
-                if st.button("Submit Answer"):
-
-                    if answer == row["Answer"]:
-
-                        st.success("Correct ✅")
-
-                        st.session_state.quiz_score += 1
-
-                    else:
-
-                        st.error(
-                            f"Wrong ❌ Correct Answer: {row['Answer']}"
-                        )
-
-                    st.info(
-                        f"Explanation: {row['Explanation']}"
+                # Difficulty filter — match against topics table
+                if pyq_diff != "All" and not topics_df.empty:
+                    _diff_topics = set(
+                        topics_df[
+                            (topics_df["Subject"] == pyq_sub) &
+                            (topics_df["Difficulty"] == pyq_diff)
+                        ]["Topic"].str.strip().str.lower()
                     )
+                    if _diff_topics:
+                        # Filter questions whose topic text contains a studied topic keyword
+                        _mask = _pool["Question"].str.lower().apply(
+                            lambda q: any(t in q for t in _diff_topics)
+                        )
+                        _filtered_pool = _pool[_mask]
+                        _pool = _filtered_pool if not _filtered_pool.empty else _pool
 
+                reset_pyq()
+                _pyq = ss("pyq")
+                _pyq["data"]    = _pool.sample(min(20, len(_pool))).reset_index(drop=True)
+                _pyq["subject"] = pyq_sub
+                st.rerun()
 
+            # ── PYQ Quiz Player ───────────────────────────────────
+            if _pyq["data"] is not None:
+                _pqs  = _pyq["data"]
+                _pidx = _pyq["index"]
 
-                if st.button("Next Question"):
+                if _pidx < len(_pqs):
+                    _prow = _pqs.iloc[_pidx]
+                    st.subheader(f"Question {_pidx + 1} / {len(_pqs)}")
+                    st.progress((_pidx + 1) / len(_pqs))
+                    st.markdown(f"**{_prow['Question']}**")
 
-                    st.session_state.quiz_index += 1
+                    _popts = [
+                        _prow["OptionA"], _prow["OptionB"],
+                        _prow["OptionC"], _prow["OptionD"],
+                    ]
+                    _p_radio_key = f"pyq_r_{abs(hash(pyq_sub))}_{_pidx}"
+                    _p_answer    = st.radio("Your answer:", _popts, key=_p_radio_key)
 
-                    st.rerun()
+                    _pc1, _pc2 = st.columns(2)
+                    with _pc1:
+                        if st.button("✅ Submit", key=f"pyq_sub_{_pidx}") and not _pyq["submitted"]:
+                            _p_correct = str(_prow.get("Answer", "")).strip()
+                            if not _p_correct:
+                                st.warning("No answer recorded for this question.")
+                            elif _p_answer == _p_correct:
+                                st.success("Correct ✅")
+                                _pyq["score"] += 1
+                            else:
+                                st.error(f"Wrong ❌ — Correct: **{_p_correct}**")
+                            st.info(f"💡 {_prow.get('Explanation', 'No explanation.')}")
+                            _pyq["submitted"] = True
 
-            else:
-
-                st.success(
-                    f"""
-                    Quiz Completed!
-
-                    Score:
-                    {st.session_state.quiz_score}
-                    / {len(quiz)}
-                    """
-                )
-
-                percentage = (
-                    st.session_state.quiz_score
-                    / len(quiz)
-                ) * 100
-
-                st.write(
-                    f"Percentage: {round(percentage,2)}%"
-                )
-
-                if percentage >= 80:
-                    st.success("Excellent TNPSC Preparation 🔥")
-
-                elif percentage >= 60:
-                    st.info("Good Progress 👍")
+                    with _pc2:
+                        if st.button("Next ▶", key=f"pyq_nxt_{_pidx}"):
+                            _pyq["index"]     += 1
+                            _pyq["submitted"]  = False
+                            st.rerun()
 
                 else:
-                    st.warning("Needs More Practice 📚")
+                    # ── PYQ Results ───────────────────────────────
+                    _ps  = _pyq["score"]
+                    _pt  = len(_pqs)
+                    _pp  = round(_ps / _pt * 100, 2) if _pt else 0
 
-                if st.button("Restart Quiz"):
+                    st.success(f"🎉 Score: {_ps} / {_pt}  ({_pp}%)")
+                    if _pp >= 80:   st.success("Excellent TNPSC Preparation 🔥")
+                    elif _pp >= 60: st.info("Good Progress 👍")
+                    else:           st.warning("Needs More Practice 📚")
 
-                    st.session_state.quiz_data = None
-                    st.session_state.quiz_index = 0
-                    st.session_state.quiz_score = 0
+                    if not _pyq["score_saved"]:
+                        db_save_score({
+                            "type": "pyq_quiz", "subject": pyq_sub,
+                            "score": _ps, "total": _pt, "percentage": _pp,
+                        })
+                        _pyq["score_saved"] = True
 
-                    st.rerun()
+                    if st.button("🔄 Restart PYQ Quiz", key="pyq_restart_btn"):
+                        reset_pyq()
+                        st.rerun()
 
+
+# ══════════════════════════════════════════════════════════════════
+# PAGE: REPORT
+# ══════════════════════════════════════════════════════════════════
 elif page == "Report":
 
-    st.header("Performance Report")
+    st.header("📊 Performance Report")
 
-    import matplotlib.pyplot as plt
+    # ── Study Progress ────────────────────────────────────────────
+    st.subheader("Study Overview")
 
-    # 🚨 SAFETY CHECK (MOST IMPORTANT)
     if topics_df.empty:
-        st.warning("No topics available. Please add topics in Study Tracker first.")
+        st.warning("No topics yet. Add topics in Study Tracker first.")
     else:
+        _tot   = len(topics_df)
+        _comp  = int((topics_df["Status"] == Status.COMPLETED.value).sum())
+        _prog  = int((topics_df["Status"] == Status.IN_PROGRESS.value).sum())
+        _ns    = _tot - _comp - _prog
+        _ratio = _comp / _tot if _tot else 0.0
 
-        # -----------------------------
-        # 1. Topics per Subject
-        # -----------------------------
-        st.subheader("Topics per Subject")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Total Topics",    _tot)
+        m2.metric("✅ Completed",    _comp)
+        m3.metric("🔄 In Progress",  _prog)
+        m4.metric("⏳ Not Started",  _ns)
+        m5.metric("Completion %",    f"{round(_ratio*100,1)}%")
+        st.progress(_ratio)
 
-        subject_counts = topics_df["Subject"].fillna("Unknown").value_counts()
+        # Topics per Subject
+        safe_bar_chart(
+            topics_df["Subject"].fillna("Unknown").value_counts(),
+            ylabel="Topics",
+            title="Topics per Subject",
+        )
 
-        fig, ax = plt.subplots(figsize=(5, 3))
+        # Status Distribution
+        _status_counts = (
+            topics_df["Status"]
+            .apply(lambda v: STATUS_LABELS.get(normalize_status(v), v))
+            .value_counts()
+        )
+        safe_bar_chart(_status_counts, ylabel="Count", title="Study Status Distribution")
 
-        subject_counts.plot(kind="bar", ax=ax)
+        # Subject × Status pivot
+        st.subheader("Subject × Status Breakdown")
+        _pivot = (
+            topics_df
+            .assign(Status=topics_df["Status"].apply(
+                lambda v: STATUS_LABELS.get(normalize_status(v), v)
+            ))
+            .groupby(["Subject", "Status"])
+            .size()
+            .unstack(fill_value=0)
+        )
+        st.dataframe(_pivot, use_container_width=True)
 
-        ax.set_ylabel("Number of Topics")
-        ax.set_ylim(0, subject_counts.max() * 1.2)
+        # Difficulty Distribution
+        safe_bar_chart(
+            topics_df["Difficulty"].fillna("Unknown").value_counts(),
+            ylabel="Topics",
+            title="Topics by Difficulty",
+        )
 
-        if len(subject_counts) <= 15:
-            for i, v in enumerate(subject_counts.values):
-                ax.text(i, v, str(v), ha="center", fontsize=8)
+        # Weak area detector
+        st.subheader("⚠️ Weak Areas (Not Started + Easy topics)")
+        _weak = topics_df[
+            (topics_df["Status"] == Status.NOT_STARTED.value) &
+            (topics_df["Difficulty"] == "Easy")
+        ][["Subject", "Topic", "Difficulty"]].reset_index(drop=True)
+        if _weak.empty:
+            st.success("No easy topics left unstarted — great job!")
+        else:
+            st.dataframe(_weak, use_container_width=True, hide_index=True)
 
-        st.pyplot(fig, use_container_width=False)
+    # ── Quiz Score History ────────────────────────────────────────
+    st.divider()
+    st.subheader("🏆 Quiz Score History")
 
-        # -----------------------------
-        # 2. Status Distribution
-        # -----------------------------
-        st.subheader("Study Status Overview")
+    _scores_raw = db_get_scores()
+    if not _scores_raw:
+        st.info("No quiz scores recorded yet. Complete a quiz to see results here.")
+    else:
+        _sdf = pd.DataFrame(_scores_raw).drop(columns=["_id"], errors="ignore")
+        _sdf["date"] = pd.to_datetime(_sdf["date"]).dt.strftime("%d %b %Y  %H:%M")
 
-        status_counts = topics_df["Status"].fillna("Not Started").value_counts()
+        # Summary stats
+        _sa1, _sa2, _sa3 = st.columns(3)
+        _sa1.metric("Total Quizzes Taken", len(_sdf))
+        _sa2.metric("Average Score %",     f"{round(_sdf['percentage'].mean(), 1)}%")
+        _sa3.metric("Best Score %",        f"{round(_sdf['percentage'].max(), 1)}%")
 
-        fig2, ax2 = plt.subplots(figsize=(5, 3))
+        # Score trend chart
+        _sdf_sorted = _sdf.sort_values("date")
+        safe_bar_chart(
+            _sdf_sorted.reset_index(drop=True)["percentage"].rename("Score %"),
+            ylabel="Score %",
+            title="Quiz Score Trend (chronological)",
+        )
 
-        status_counts.plot(kind="bar", ax=ax2)
-
-        ax2.set_ylabel("Count")
-        ax2.set_ylim(0, status_counts.max() * 1.2)
-
-        if len(status_counts) <= 15:
-            for i, v in enumerate(status_counts.values):
-                ax2.text(i, v, str(v), ha="center", fontsize=8)
-
-        st.pyplot(fig2, use_container_width=False)
+        # Full table
+        _cols = [c for c in ["date", "type", "topic", "subject", "score", "total", "percentage"]
+                 if c in _sdf.columns]
+        st.dataframe(
+            _sdf[_cols].sort_values("date", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+        )

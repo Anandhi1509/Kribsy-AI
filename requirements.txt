@@ -3,3 +3,4 @@ pandas
 matplotlib
 google-genai
 pymongo
+streamlit-google-auth

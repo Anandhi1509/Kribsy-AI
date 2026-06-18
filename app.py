@@ -13,6 +13,7 @@ from google import genai
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from streamlit_google_auth import Authenticate
+st.write("Google Auth package loaded")
 
 # ══════════════════════════════════════════════════════════════════
 # 1. CONSTANTS  – single source of truth; never use raw strings

@@ -13,6 +13,9 @@ import streamlit as st
 from google import genai
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
+# 🔥 DEBUG (safe, runs immediately)
+st.write("DEBUG CLIENT ID:")
+st.write(st.secrets["google"]["client_id"])
 
 def get_flow():
     return Flow.from_client_config(

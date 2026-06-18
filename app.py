@@ -14,9 +14,6 @@ from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from streamlit_google_auth import Authenticate
 
-import streamlit_google_auth
-st.write(streamlit_google_auth.__version__)
-
 # ══════════════════════════════════════════════════════════════════
 # 1. CONSTANTS  – single source of truth; never use raw strings
 # ══════════════════════════════════════════════════════════════════

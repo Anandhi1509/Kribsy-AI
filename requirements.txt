@@ -1,6 +1,7 @@
 streamlit
+google-auth-oauthlib
 pandas
 matplotlib
 google-genai
 pymongo
-streamlit-google-auth
+

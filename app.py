@@ -47,6 +47,11 @@ if "user" not in st.session_state:
     st.session_state.user = None
 
 
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+
+# ---------------- LOGIN BLOCK ----------------
 if st.session_state.user is None:
 
     st.title("🔐 Login Required")
@@ -55,14 +60,7 @@ if st.session_state.user is None:
 
     st.markdown(f"""
         <a href="{login_url}" target="_self">
-            <button style="
-                background-color:#4285F4;
-                color:white;
-                padding:10px 20px;
-                border:none;
-                border-radius:5px;">
-                Sign in with Google
-            </button>
+            <button>Sign in with Google</button>
         </a>
     """, unsafe_allow_html=True)
 
@@ -73,6 +71,8 @@ if st.session_state.user is None:
         st.session_state.user = creds.id_token
         st.rerun()
 
+    st.stop()   # ⭐ THIS IS THE KEY LINE
+
 else:
     st.success("Logged in 🎉")
     st.write(st.session_state.user)
@@ -80,6 +80,13 @@ else:
     if st.button("Logout"):
         st.session_state.user = None
         st.rerun()
+
+        # ---------------- DASHBOARD (ONLY AFTER LOGIN) ----------------
+
+    st.title("📊 Dashboard")
+
+    st.write("Subjects")
+    st.write("Navigation")
 
 # ══════════════════════════════════════════════════════════════════
 # 1. CONSTANTS  – single source of truth; never use raw strings

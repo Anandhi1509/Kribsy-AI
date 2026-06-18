@@ -52,26 +52,58 @@ if "user" not in st.session_state:
 
 
 # ---------------- LOGIN BLOCK ----------------
+# ---------------- SESSION INIT ----------------
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+
+# ---------------- LOGIN FLOW ----------------
 if st.session_state.user is None:
 
     st.title("🔐 Login Required")
 
-    login_url = get_login_url()
+    # Generate login URL
+    auth_url, _ = get_flow().authorization_url(
+        prompt="consent",
+        access_type="offline"
+    )
 
     st.markdown(f"""
-        <a href="{login_url}" target="_self">
-            <button>Sign in with Google</button>
+        <a href="{auth_url}" target="_self">
+            <button style="
+                background-color:#4285F4;
+                color:white;
+                padding:10px 20px;
+                border:none;
+                border-radius:5px;
+                font-size:16px;">
+                Sign in with Google
+            </button>
         </a>
     """, unsafe_allow_html=True)
 
+    # Handle callback from Google
     params = st.query_params
 
     if "code" in params:
-        creds = login_with_code(params["code"])
-        st.session_state.user = creds.id_token
-        st.rerun()
+        try:
+            creds = login_with_code(params["code"])
 
-    st.stop()   # ⭐ THIS IS THE KEY LINE
+            # Store user session
+            st.session_state.user = creds.id_token
+
+            # IMPORTANT: clean URL to prevent re-trigger loop
+            st.query_params.clear()
+
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"Login failed: {e}")
+            st.stop()
+
+
+    # IMPORTANT: stop dashboard from rendering
+    st.stop()
 
 else:
     st.success("Logged in 🎉")

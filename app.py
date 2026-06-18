@@ -7,11 +7,79 @@ from enum import Enum
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from google_auth_oauthlib.flow import Flow
 import pandas as pd
 import streamlit as st
 from google import genai
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
+
+def get_flow():
+    return Flow.from_client_config(
+        {
+            "web": {
+                "client_id": st.secrets["google"]["client_id"],
+                "client_secret": st.secrets["google"]["client_secret"],
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": [st.secrets["google"]["redirect_uri"]],
+            }
+        },
+        scopes=["openid", "email", "profile"],
+        redirect_uri=st.secrets["google"]["redirect_uri"],
+    )
+
+
+def get_login_url():
+    flow = get_flow()
+    auth_url, _ = flow.authorization_url(prompt="consent")
+    return auth_url
+
+
+def login_with_code(code):
+    flow = get_flow()
+    flow.fetch_token(code=code)
+    return flow.credentials
+
+st.set_page_config(page_title="My App")
+
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+
+if st.session_state.user is None:
+
+    st.title("🔐 Login Required")
+
+    login_url = get_login_url()
+
+    st.markdown(f"""
+        <a href="{login_url}" target="_self">
+            <button style="
+                background-color:#4285F4;
+                color:white;
+                padding:10px 20px;
+                border:none;
+                border-radius:5px;">
+                Sign in with Google
+            </button>
+        </a>
+    """, unsafe_allow_html=True)
+
+    params = st.query_params
+
+    if "code" in params:
+        creds = login_with_code(params["code"])
+        st.session_state.user = creds.id_token
+        st.rerun()
+
+else:
+    st.success("Logged in 🎉")
+    st.write(st.session_state.user)
+
+    if st.button("Logout"):
+        st.session_state.user = None
+        st.rerun()
 
 # ══════════════════════════════════════════════════════════════════
 # 1. CONSTANTS  – single source of truth; never use raw strings

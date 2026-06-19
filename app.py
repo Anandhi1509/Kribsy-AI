@@ -1,4 +1,3 @@
-
 import json
 import re
 from datetime import datetime
@@ -8,12 +7,24 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from google_auth_oauthlib.flow import Flow
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
 import pandas as pd
 import streamlit as st
 from google import genai
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
+# ══════════════════════════════════════════════════════════════════
+# 0. PAGE CONFIG  – must be the very first Streamlit command, and
+#    must be called EXACTLY ONCE. 
+# ══════════════════════════════════════════════════════════════════
+st.set_page_config(page_title="TNPSC PrepAI", page_icon="📚", layout="wide")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 1. GOOGLE OAUTH HELPERS
+# ══════════════════════════════════════════════════════════════════
 def get_flow():
     return Flow.from_client_config(
         {
@@ -32,41 +43,49 @@ def get_flow():
 
 def get_login_url():
     flow = get_flow()
-    auth_url, _ = flow.authorization_url(prompt="consent")
+    auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
     return auth_url
 
 
-def login_with_code(code):
+def login_with_code(code: str) -> dict:
+    """
+    Exchanges the auth code for tokens, VERIFIES the id_token against
+    Google's servers, and returns a plain dict with the user's
+    identity (email, name, picture). This is what should be stored
+    in session_state — never the raw JWT string.
+    """
     flow = get_flow()
     flow.fetch_token(code=code)
-    return flow.credentials
+    creds = flow.credentials
 
-st.set_page_config(page_title="My App")
+    info = google_id_token.verify_oauth2_token(
+        creds.id_token,
+        google_requests.Request(),
+        st.secrets["google"]["client_id"],
+    )
 
+    return {
+        "email": info.get("email"),
+        "name": info.get("name", info.get("email")),
+        "picture": info.get("picture"),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+# 2. SESSION INIT (single source of truth, no duplicates)
+# ══════════════════════════════════════════════════════════════════
 if "user" not in st.session_state:
     st.session_state.user = None
 
 
-if "user" not in st.session_state:
-    st.session_state.user = None
-
-
-# ---------------- LOGIN BLOCK ----------------
-# ---------------- SESSION INIT ----------------
-if "user" not in st.session_state:
-    st.session_state.user = None
-
-
-# ---------------- LOGIN FLOW ----------------
+# ══════════════════════════════════════════════════════════════════
+# 3. LOGIN FLOW
+# ══════════════════════════════════════════════════════════════════
 if st.session_state.user is None:
 
     st.title("🔐 Login Required")
 
-    # Generate login URL
-    auth_url, _ = get_flow().authorization_url(
-        prompt="consent",
-        access_type="offline"
-    )
+    auth_url = get_login_url()
 
     st.markdown(f"""
         <a href="{auth_url}" target="_self">
@@ -82,46 +101,51 @@ if st.session_state.user is None:
         </a>
     """, unsafe_allow_html=True)
 
-    # Handle callback from Google
     params = st.query_params
 
     if "code" in params:
         try:
-            creds = login_with_code(params["code"])
+            user_info = login_with_code(params["code"])
 
-            # Store user session
-            st.session_state.user = creds.id_token
+            if not user_info.get("email"):
+                st.error("Login failed: Google did not return an email address.")
+                st.stop()
 
-            # IMPORTANT: clean URL to prevent re-trigger loop
+            st.session_state.user = user_info
+
+            # Upsert the user into MongoDB so we have a persistent
+            # users collection (needed below for get_db(), so we
+            # connect directly here rather than relying on cached DB).
+            try:
+                _client = MongoClient(st.secrets["MONGO_URI"], serverSelectionTimeoutMS=5_000)
+                _client["kribsy"]["users"].update_one(
+                    {"email": user_info["email"]},
+                    {
+                        "$set": {
+                            "name": user_info["name"],
+                            "picture": user_info.get("picture"),
+                            "last_login": datetime.now(),
+                        },
+                        "$setOnInsert": {"created_at": datetime.now()},
+                    },
+                    upsert=True,
+                )
+            except PyMongoError as e:
+                # Don't block login over a logging failure, just warn.
+                st.warning(f"Logged in, but couldn't sync user profile: {e}")
+
             st.query_params.clear()
-
             st.rerun()
 
         except Exception as e:
             st.error(f"Login failed: {e}")
             st.stop()
 
-
-    # IMPORTANT: stop dashboard from rendering
     st.stop()
 
-else:
-    st.success("Logged in 🎉")
-    st.write(st.session_state.user)
-
-    if st.button("Logout"):
-        st.session_state.user = None
-        st.rerun()
-
-        # ---------------- DASHBOARD (ONLY AFTER LOGIN) ----------------
-
-    st.title("📊 Dashboard")
-
-    st.write("Subjects")
-    st.write("Navigation")
 
 # ══════════════════════════════════════════════════════════════════
-# 1. CONSTANTS  – single source of truth; never use raw strings
+# 4. CONSTANTS
 # ══════════════════════════════════════════════════════════════════
 class Status(str, Enum):
     NOT_STARTED = "not started"
@@ -146,14 +170,13 @@ GEMINI_MODELS = [
     "gemini-2.5-flash-lite",
 ]
 
+CURRENT_USER_EMAIL = st.session_state.user["email"]
+
+
 # ══════════════════════════════════════════════════════════════════
-# 2. HELPERS
+# 5. HELPERS
 # ══════════════════════════════════════════════════════════════════
 def normalize_status(value) -> Status:
-    """
-    Convert any raw string → Status enum.
-    Unknown / None / empty → Status.NOT_STARTED.
-    """
     raw = str(value).strip().lower() if value is not None else ""
     for s in Status:
         if s.value == raw:
@@ -162,21 +185,11 @@ def normalize_status(value) -> Status:
 
 
 def parse_ai_json(raw: str) -> list:
-    """
-    Robustly extract a JSON array from an AI response.
-    Strategy:
-      1. Strip markdown fences.
-      2. Try direct json.loads.
-      3. Fallback: regex for the first [...] block.
-      4. Validate each item has required keys.
-    Raises ValueError with a human-readable message on failure.
-    """
     cleaned = (
         raw.replace("```json", "")
            .replace("```", "")
            .strip()
     )
-    # Try direct parse first (cleanest path)
     for candidate in [cleaned]:
         try:
             data = json.loads(candidate)
@@ -185,7 +198,6 @@ def parse_ai_json(raw: str) -> list:
         except json.JSONDecodeError:
             pass
 
-    # Fallback: extract first [...] block
     match = re.search(r"\[.*?\]", cleaned, re.DOTALL)
     if match:
         try:
@@ -206,7 +218,6 @@ def _validate_quiz_items(items: list) -> list:
         if missing:
             st.warning(f"Question {i+1} skipped — missing fields: {missing}")
             continue
-        # Normalize answer: strip + upper; default to "A" if invalid
         ans = str(item.get("answer", "A")).strip().upper()
         item["answer"] = ans if ans in ("A", "B", "C", "D") else "A"
         item.setdefault("explanation", "No explanation provided.")
@@ -217,7 +228,6 @@ def _validate_quiz_items(items: list) -> list:
 
 
 def safe_bar_chart(series: pd.Series, ylabel: str, title: str):
-    """Render a bar chart safely — never crashes on empty/zero data."""
     if series.empty or series.sum() == 0:
         st.info(f"No data available yet for: **{title}**")
         return
@@ -236,14 +246,13 @@ def safe_bar_chart(series: pd.Series, ylabel: str, title: str):
 
 
 # ══════════════════════════════════════════════════════════════════
-# 3. DATABASE LAYER  – all MongoDB in one place
+# 6. DATABASE LAYER  – all MongoDB in one place
+#    NOTE: "topics" and "scores" are now scoped per-user via the
+#    user's email. "questions" stays a shared bank (e.g. PYQs) unless
+#    you want AI-generated quizzes to be private too — see db_save_score.
 # ══════════════════════════════════════════════════════════════════
 @st.cache_resource
 def get_db():
-    """
-    Single cached MongoDB connection.
-    Raises and stops the app if the DB is unreachable.
-    """
     try:
         client = MongoClient(
             st.secrets["MONGO_URI"],
@@ -252,6 +261,7 @@ def get_db():
         client.server_info()
         db = client["kribsy"]
         return {
+            "users":     db["users"],
             "topics":    db["topics"],
             "questions": db["questions"],
             "scores":    db["quiz_scores"],
@@ -262,10 +272,6 @@ def get_db():
 
 
 def db_run(operation, *args, **kwargs):
-    """
-    Wraps any MongoDB call with error handling.
-    Returns the result or None on failure.
-    """
     try:
         return operation(*args, **kwargs)
     except PyMongoError as e:
@@ -273,18 +279,20 @@ def db_run(operation, *args, **kwargs):
         return None
 
 
-# ── Typed DB operations ───────────────────────────────────────────
+# ── Typed DB operations (all scoped to CURRENT_USER_EMAIL) ────────
 def db_get_topics() -> list:
-    return list(db_run(DB["topics"].find) or [])
+    return list(db_run(DB["topics"].find, {"user_email": CURRENT_USER_EMAIL}) or [])
 
 def db_get_questions() -> list:
+    # Shared question bank — not user-scoped.
     return list(db_run(DB["questions"].find) or [])
 
 def db_get_scores() -> list:
-    return list(db_run(DB["scores"].find) or [])
+    return list(db_run(DB["scores"].find, {"user_email": CURRENT_USER_EMAIL}) or [])
 
 def db_insert_topic(subject: str, topic: str, difficulty: str) -> bool:
     result = db_run(DB["topics"].insert_one, {
+        "user_email": CURRENT_USER_EMAIL,
         "Subject":    subject,
         "Topic":      topic,
         "Difficulty": difficulty,
@@ -293,60 +301,68 @@ def db_insert_topic(subject: str, topic: str, difficulty: str) -> bool:
     return result is not None
 
 def db_topic_exists(subject: str, topic: str) -> bool:
-    return bool(db_run(DB["topics"].find_one, {"Subject": subject, "Topic": topic}))
+    return bool(db_run(DB["topics"].find_one, {
+        "user_email": CURRENT_USER_EMAIL,
+        "Subject": subject,
+        "Topic": topic,
+    }))
 
 def db_update_status(subject: str, topic: str, status: Status) -> bool:
     result = db_run(
         DB["topics"].update_one,
-        {"Subject": subject, "Topic": topic},
+        {"user_email": CURRENT_USER_EMAIL, "Subject": subject, "Topic": topic},
         {"$set": {"Status": status.value}},
     )
     return result is not None
 
 def db_delete_topic(subject: str, topic: str) -> bool:
-    result = db_run(DB["topics"].delete_one, {"Subject": subject, "Topic": topic})
+    result = db_run(DB["topics"].delete_one, {
+        "user_email": CURRENT_USER_EMAIL,
+        "Subject": subject,
+        "Topic": topic,
+    })
     return result is not None
 
 def db_save_score(payload: dict) -> bool:
-    result = db_run(DB["scores"].insert_one, {**payload, "date": datetime.now()})
+    result = db_run(DB["scores"].insert_one, {
+        **payload,
+        "user_email": CURRENT_USER_EMAIL,
+        "date": datetime.now(),
+    })
     return result is not None
 
 
 # ══════════════════════════════════════════════════════════════════
-# 4. DATA LOADERS  (cached DataFrames; cleared after writes)
+# 7. DATA LOADERS  (cached DataFrames; cleared after writes)
+#    Cache key includes the user's email so one user's cached data
+#    never leaks into another user's session.
 # ══════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=30)
-def load_topics() -> pd.DataFrame:
+def load_topics(_user_email: str) -> pd.DataFrame:
     data = db_get_topics()
 
-    # If DB empty → return safe structure
     if not data:
         return pd.DataFrame(columns=["Subject", "Topic", "Difficulty", "Status"])
 
     df = pd.DataFrame(data)
 
-    # Remove Mongo ID safely
     if "_id" in df.columns:
         df = df.drop(columns=["_id"])
+    if "user_email" in df.columns:
+        df = df.drop(columns=["user_email"])
 
-    # 🔥 FORCE REQUIRED COLUMNS (MOST IMPORTANT FIX)
     required_cols = ["Subject", "Topic", "Difficulty", "Status"]
-
     for col in required_cols:
         if col not in df.columns:
             df[col] = "Unknown" if col != "Status" else Status.NOT_STARTED.value
 
-    # Clean NaN values
     df["Subject"] = df["Subject"].fillna("Unknown")
     df["Topic"] = df["Topic"].fillna("Unknown")
     df["Difficulty"] = df["Difficulty"].fillna("Easy")
     df["Status"] = df["Status"].fillna(Status.NOT_STARTED.value)
-
-    # Normalize status
     df["Status"] = df["Status"].apply(lambda v: normalize_status(v).value)
 
     return df
-
 
 
 @st.cache_data(ttl=30)
@@ -372,25 +388,21 @@ def refresh_data():
 
 
 # ══════════════════════════════════════════════════════════════════
-# 5. UNIFIED SESSION STATE
-# All keys registered once at startup under a single namespace.
+# 8. UNIFIED SESSION STATE
 # ══════════════════════════════════════════════════════════════════
 _SESSION_DEFAULTS = {
-    # Dashboard
     "dash": {
         "last_prompt": "",
         "ai_error":    False,
     },
-    # AI Quiz
     "aiq": {
         "questions":   [],
         "index":       0,
         "score":       0,
         "score_saved": False,
         "topic":       "",
-        "submitted":   False,   # tracks if current answer was submitted
+        "submitted":   False,
     },
-    # PYQ Quiz
     "pyq": {
         "data":        None,
         "index":       0,
@@ -402,17 +414,14 @@ _SESSION_DEFAULTS = {
 }
 
 def init_session():
-    """Initialise all session state groups exactly once."""
     for group, defaults in _SESSION_DEFAULTS.items():
         if group not in st.session_state:
             st.session_state[group] = dict(defaults)
         else:
-            # Fill any missing keys added in later versions
             for k, v in defaults.items():
                 st.session_state[group].setdefault(k, v)
 
 def ss(group: str) -> dict:
-    """Shorthand accessor: ss('aiq')['index']"""
     return st.session_state[group]
 
 def reset_aiq():
@@ -423,7 +432,7 @@ def reset_pyq():
 
 
 # ══════════════════════════════════════════════════════════════════
-# 6. GEMINI CLIENT
+# 9. GEMINI CLIENT
 # ══════════════════════════════════════════════════════════════════
 @st.cache_resource
 def get_gemini():
@@ -442,25 +451,35 @@ def ask_gemini(prompt: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 7. APP BOOTSTRAP
+# 10. APP BOOTSTRAP
 # ══════════════════════════════════════════════════════════════════
-st.set_page_config(page_title="TNPSC PrepAI", page_icon="📚", layout="wide")
+DB = get_db()
+init_session()
 
-DB = get_db()          # cached connection
-init_session()         # unified state
-
-topics_df    = load_topics()
+topics_df    = load_topics(CURRENT_USER_EMAIL)
 questions_df = load_questions()
 
 
 # ══════════════════════════════════════════════════════════════════
-# 8. SIDEBAR NAVIGATION
+# 11. SIDEBAR  – user info, logout, navigation
 # ══════════════════════════════════════════════════════════════════
-st.sidebar.title("Navigation")
-page = st.sidebar.radio(
-    "Choose Page",
-    ["Dashboard", "Subjects", "Study Tracker", "Quiz", "Report"],
-)
+with st.sidebar:
+    _user = st.session_state.user
+    if _user.get("picture"):
+        st.image(_user["picture"], width=50)
+    st.write(f"**{_user['name']}**")
+    st.caption(_user["email"])
+    if st.button("Logout"):
+        st.session_state.user = None
+        st.cache_data.clear()
+        st.rerun()
+
+    st.divider()
+    st.title("Navigation")
+    page = st.radio(
+        "Choose Page",
+        ["Dashboard", "Subjects", "Study Tracker", "Quiz", "Report"],
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -474,7 +493,6 @@ if page == "Dashboard":
         "practice PYQs, and get AI explanations — all in one place."
     )
 
-    # ── Metrics ───────────────────────────────────────────────────
     total     = len(topics_df)
     completed = int((topics_df["Status"] == Status.COMPLETED.value).sum()) if not topics_df.empty else 0
     subjects  = topics_df["Subject"].nunique() if not topics_df.empty else 0
@@ -489,7 +507,6 @@ if page == "Dashboard":
 
     st.divider()
 
-    # ── AI Topic Explainer ────────────────────────────────────────
     st.subheader("🤖 AI Topic Explainer")
 
     _dash = ss("dash")
@@ -508,7 +525,6 @@ if page == "Dashboard":
         if _dash["ai_error"]:
             if st.button("🔁 Retry", key="dash_retry_btn"):
                 _dash["ai_error"] = False
-                # Keep last_prompt so it re-runs automatically below
                 st.rerun()
 
     if _dash["last_prompt"].strip():
@@ -571,13 +587,11 @@ elif page == "Subjects":
                 cb.metric("🔄 In Progress", prog_s)
                 cc.metric("⏳ Not Started", not_s)
 
-                # Topic-level detail table
                 _display = sub_df[["Topic", "Difficulty", "Status"]].copy()
                 _display["Status"] = _display["Status"].apply(
                     lambda v: STATUS_LABELS.get(normalize_status(v), v)
                 )
                 st.dataframe(_display, use_container_width=True, hide_index=True)
-
 
 # ══════════════════════════════════════════════════════════════════
 # PAGE: STUDY TRACKER
@@ -586,7 +600,6 @@ elif page == "Study Tracker":
 
     st.header("Study Tracker")
 
-    # ── Add Topic ─────────────────────────────────────────────────
     st.subheader("➕ Add New Topic")
 
     add_sub  = st.selectbox("Subject",    SUBJECTS,     key="add_sub_sel")
@@ -606,7 +619,6 @@ elif page == "Study Tracker":
             else:
                 st.error("Failed to save topic. Check database connection.")
 
-    # ── Saved Topics Table ────────────────────────────────────────
     st.subheader("📋 Saved Topics")
     if topics_df.empty:
         st.info("No topics yet. Add one above.")
@@ -617,435 +629,286 @@ elif page == "Study Tracker":
         )
         st.dataframe(_display_df, use_container_width=True, hide_index=True)
 
-    # ── Update Status ─────────────────────────────────────────────
-    st.subheader("✏️ Update Topic Status")
-
-    if topics_df.empty:
-        st.warning("No topics to update.")
-    else:
-        upd_sub = st.selectbox(
-            "Filter by Subject",
-            sorted(topics_df.get("Subject", pd.Series(["Unknown"])).dropna().unique()),
-            key="upd_sub_sel",
-        )
-        _filtered = topics_df[topics_df.get("Subject", "") == upd_sub]
-        upd_top   = st.selectbox(
-            "Select Topic",
-            _filtered["Topic"].unique(),
-            key="upd_top_sel",
-        )
-        upd_label  = st.selectbox(
-            "New Status",
-            list(STATUS_LABELS.values()),
-            key="upd_status_sel",
-        )
-        upd_status = STATUS_FROM_LABEL[upd_label]
-
-        if st.button("✅ Update Status", key="upd_status_btn"):
-            if db_update_status(upd_sub, upd_top, upd_status):
-                st.success(f"Status updated to '{upd_label}' for '{upd_top}'.")
-                refresh_data()
-                st.rerun()
-            else:
-                st.error("Update failed. Check database connection.")
-
-    # ── Delete Topic ──────────────────────────────────────────────
-    st.subheader("🗑 Delete Topic")
-
-    if not topics_df.empty:
-        del_sub = st.selectbox(
-            "Subject (delete)",
-            sorted(topics_df.get("Subject", pd.Series(["Unknown"])).dropna().unique()),
-            key="del_sub_sel",
-        )
-        _del_filtered = topics_df[topics_df["Subject"] == del_sub]
-        del_top       = st.selectbox(
-            "Topic to Delete",
-            _del_filtered["Topic"].unique(),
-            key="del_top_sel",
-        )
-        del_confirm = st.checkbox("I confirm I want to permanently delete this topic", key="del_confirm")
-
-        if st.button("🗑 Delete Topic", key="del_topic_btn"):
-            if not del_confirm:
-                st.warning("Tick the confirmation checkbox first.")
-            elif db_delete_topic(del_sub, del_top):
-                st.success(f"Topic '{del_top}' deleted.")
-                refresh_data()
-                st.rerun()
-            else:
-                st.error("Delete failed. Check database connection.")
-
-
-# ══════════════════════════════════════════════════════════════════
-# PAGE: QUIZ
-# ══════════════════════════════════════════════════════════════════
-elif page == "Quiz":
-
-    st.header("TNPSC Quiz")
-
-    # ─────────────────────────────────────────────────────────────
-    # SECTION A: AI Quiz
-    # State namespace: ss("aiq")
-    # ─────────────────────────────────────────────────────────────
-    st.subheader("🤖 AI Quiz Generator")
-
-    _aiq = ss("aiq")
-
-    aiq_topic = st.text_input("Quiz Topic", key="aiq_topic_input")
-    aiq_num   = st.selectbox("Number of Questions", [5, 10, 15, 20], key="aiq_num_sel")
-    aiq_diff  = st.selectbox("Difficulty Level", DIFFICULTIES, key="aiq_diff_sel")
-
-    if st.button("🎯 Generate AI Quiz", key="aiq_generate_btn"):
-        if not aiq_topic.strip():
-            st.warning("Please enter a topic.")
-        else:
-            _gen_prompt = f"""
-You are a TNPSC Group 1 question setter.
-Generate exactly {aiq_num} {aiq_diff}-level questions on: {aiq_topic.strip()}
-
-Return ONLY a valid JSON array — no markdown, no extra text.
-
-Format:
-[
-  {{
-    "question": "...",
-    "optionA": "...",
-    "optionB": "...",
-    "optionC": "...",
-    "optionD": "...",
-    "answer": "A",
-    "explanation": "..."
-  }}
-]
-
-Rules:
-- TNPSC Group 1 exam style
-- One correct answer only (A / B / C / D)
-- Clear, detailed explanation per question
-- Use double quotes; no apostrophes inside values
-- Strictly return only the JSON array
-"""
-            with st.spinner("Generating quiz..."):
-                _raw = ask_gemini(_gen_prompt)
-
-            try:
-                _questions = parse_ai_json(_raw)
-                reset_aiq()
-                _aiq = ss("aiq")
-                _aiq["questions"] = _questions
-                _aiq["topic"]     = aiq_topic.strip()
-                st.success(f"✅ {len(_questions)} questions generated!")
-            except ValueError as _ve:
-                st.error(f"Quiz generation failed: {_ve}")
-                with st.expander("Show raw AI response"):
-                    st.text(_raw)
-
-    # ── AI Quiz Player ────────────────────────────────────────────
-    if _aiq["questions"]:
-        st.divider()
-        _qs  = _aiq["questions"]
-        _idx = _aiq["index"]
-
-        if _idx < len(_qs):
-            _q = _qs[_idx]
-            st.subheader(f"Question {_idx + 1} / {len(_qs)}")
-            st.progress((_idx + 1) / len(_qs))
-            st.markdown(f"**{_q['question']}**")
-
-            _opts = {
-                "A": _q["optionA"],
-                "B": _q["optionB"],
-                "C": _q["optionC"],
-                "D": _q["optionD"],
-            }
-            # Key incorporates topic hash + index → unique across reruns
-            _radio_key = f"aiq_r_{abs(hash(_aiq['topic']))}_{_idx}"
-            _selected  = st.radio(
-                "Your answer:", list(_opts.values()), key=_radio_key
+        # ── Update / Delete controls ────────────────────────────
+        st.subheader("✏️ Update or Delete a Topic")
+        sel_sub = st.selectbox("Subject", sorted(topics_df["Subject"].unique()), key="upd_sub_sel")
+        sub_topics = topics_df[topics_df["Subject"] == sel_sub]["Topic"].tolist()
+        if sub_topics:
+            sel_top = st.selectbox("Topic", sub_topics, key="upd_top_sel")
+            new_status_label = st.selectbox(
+                "New Status", list(STATUS_LABELS.values()), key="upd_status_sel"
             )
-
-            _c1, _c2 = st.columns(2)
-            with _c1:
-                if st.button("✅ Submit", key=f"aiq_sub_{_idx}") and not _aiq["submitted"]:
-                    _correct = _opts[_q["answer"]]
-                    if _selected == _correct:
-                        st.success("Correct ✅")
-                        _aiq["score"] += 1
-                    else:
-                        st.error(f"Wrong ❌ — Correct: **{_correct}**")
-                    st.info(f"💡 {_q['explanation']}")
-                    _aiq["submitted"] = True
-
-            with _c2:
-                if st.button("Next ▶", key=f"aiq_nxt_{_idx}"):
-                    _aiq["index"]     += 1
-                    _aiq["submitted"]  = False
-                    st.rerun()
-
-        else:
-            # ── AI Quiz Results ───────────────────────────────────
-            _sc  = _aiq["score"]
-            _tot = len(_qs)
-            _pct = round(_sc / _tot * 100, 2) if _tot else 0
-
-            st.success(f"🎉 Score: {_sc} / {_tot}  ({_pct}%)")
-            if _pct >= 80:   st.success("Excellent TNPSC Preparation 🔥")
-            elif _pct >= 60: st.info("Good Progress 👍")
-            else:            st.warning("Needs More Practice 📚")
-
-            if not _aiq["score_saved"]:
-                db_save_score({
-                    "type": "ai_quiz", "topic": _aiq["topic"],
-                    "score": _sc, "total": _tot, "percentage": _pct,
-                })
-                _aiq["score_saved"] = True
-
-            if st.button("🔄 Restart AI Quiz", key="aiq_restart_btn"):
-                reset_aiq()
-                st.rerun()
-
-    # ─────────────────────────────────────────────────────────────
-    # SECTION B: PYQ Quiz
-    # State namespace: ss("pyq")
-    # Filtered by topics the student has studied (completed / in progress)
-    # with optional difficulty filter.
-    # ─────────────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("📜 PYQ Quiz Generator")
-
-    _pyq = ss("pyq")
-
-    if questions_df.empty:
-        st.warning("No PYQ questions found. Please add questions to the database.")
-    else:
-        # Build studied-subjects set (case-insensitive, space-safe)
-        _studied = set()
-        if not topics_df.empty:
-            _studied = set(
-                topics_df[
-                    topics_df["Status"].isin([
-                        Status.COMPLETED.value, Status.IN_PROGRESS.value
-                    ])
-                ]["Subject"]
-                .dropna()
-                .str.strip()
-                .str.lower()
-            )
-
-        _avail_subjects = sorted([
-            s for s in questions_df["Subject"].dropna().unique()
-            if (not _studied) or s.strip().lower() in _studied
-        ])
-
-        if not _avail_subjects:
-            st.warning(
-                "No studied subjects with PYQs found. "
-                "Mark topics as In Progress or Completed first."
-            )
-        else:
-            pyq_sub  = st.selectbox("Subject", _avail_subjects, key="pyq_sub_sel")
-            pyq_diff = st.selectbox(
-                "Filter by Difficulty (optional)",
-                ["All"] + DIFFICULTIES,
-                key="pyq_diff_sel",
-            )
-
-            # Reset state when subject changes
-            if pyq_sub != _pyq["subject"]:
-                reset_pyq()
-                _pyq = ss("pyq")
-                _pyq["subject"] = pyq_sub
-
-            if st.button("▶ Start PYQ Quiz", key="pyq_start_btn"):
-                _pool = questions_df[questions_df["Subject"] == pyq_sub].copy()
-
-                # Difficulty filter — match against topics table
-                if pyq_diff != "All" and not topics_df.empty:
-                    _diff_topics = set(
-                        topics_df[
-                            (topics_df["Subject"] == pyq_sub) &
-                            (topics_df["Difficulty"] == pyq_diff)
-                        ]["Topic"].str.strip().str.lower()
-                    )
-                    if _diff_topics:
-                        # Filter questions whose topic text contains a studied topic keyword
-                        _mask = _pool["Question"].str.lower().apply(
-                            lambda q: any(t in q for t in _diff_topics)
-                        )
-                        _filtered_pool = _pool[_mask]
-                        _pool = _filtered_pool if not _filtered_pool.empty else _pool
-
-                reset_pyq()
-                _pyq = ss("pyq")
-                _pyq["data"]    = _pool.sample(min(20, len(_pool))).reset_index(drop=True)
-                _pyq["subject"] = pyq_sub
-                st.rerun()
-
-            # ── PYQ Quiz Player ───────────────────────────────────
-            if _pyq["data"] is not None:
-                _pqs  = _pyq["data"]
-                _pidx = _pyq["index"]
-
-                if _pidx < len(_pqs):
-                    _prow = _pqs.iloc[_pidx]
-                    st.subheader(f"Question {_pidx + 1} / {len(_pqs)}")
-                    st.progress((_pidx + 1) / len(_pqs))
-                    st.markdown(f"**{_prow['Question']}**")
-
-                    _popts = [
-                        _prow["OptionA"], _prow["OptionB"],
-                        _prow["OptionC"], _prow["OptionD"],
-                    ]
-                    _p_radio_key = f"pyq_r_{abs(hash(pyq_sub))}_{_pidx}"
-                    _p_answer    = st.radio("Your answer:", _popts, key=_p_radio_key)
-
-                    _pc1, _pc2 = st.columns(2)
-                    with _pc1:
-                        if st.button("✅ Submit", key=f"pyq_sub_{_pidx}") and not _pyq["submitted"]:
-                            _p_correct = str(_prow.get("Answer", "")).strip()
-                            if not _p_correct:
-                                st.warning("No answer recorded for this question.")
-                            elif _p_answer == _p_correct:
-                                st.success("Correct ✅")
-                                _pyq["score"] += 1
-                            else:
-                                st.error(f"Wrong ❌ — Correct: **{_p_correct}**")
-                            st.info(f"💡 {_prow.get('Explanation', 'No explanation.')}")
-                            _pyq["submitted"] = True
-
-                    with _pc2:
-                        if st.button("Next ▶", key=f"pyq_nxt_{_pidx}"):
-                            _pyq["index"]     += 1
-                            _pyq["submitted"]  = False
-                            st.rerun()
-
-                else:
-                    # ── PYQ Results ───────────────────────────────
-                    _ps  = _pyq["score"]
-                    _pt  = len(_pqs)
-                    _pp  = round(_ps / _pt * 100, 2) if _pt else 0
-
-                    st.success(f"🎉 Score: {_ps} / {_pt}  ({_pp}%)")
-                    if _pp >= 80:   st.success("Excellent TNPSC Preparation 🔥")
-                    elif _pp >= 60: st.info("Good Progress 👍")
-                    else:           st.warning("Needs More Practice 📚")
-
-                    if not _pyq["score_saved"]:
-                        db_save_score({
-                            "type": "pyq_quiz", "subject": pyq_sub,
-                            "score": _ps, "total": _pt, "percentage": _pp,
-                        })
-                        _pyq["score_saved"] = True
-
-                    if st.button("🔄 Restart PYQ Quiz", key="pyq_restart_btn"):
-                        reset_pyq()
+            cu, cd = st.columns(2)
+            with cu:
+                if st.button("Update Status", key="upd_status_btn"):
+                    new_status = STATUS_FROM_LABEL[new_status_label]
+                    if db_update_status(sel_sub, sel_top, new_status):
+                        st.success("Status updated.")
+                        refresh_data()
+                        st.rerun()
+            with cd:
+                if st.button("🗑️ Delete Topic", key="del_top_btn"):
+                    if db_delete_topic(sel_sub, sel_top):
+                        st.success("Topic deleted.")
+                        refresh_data()
                         st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════
+# PAGE: QUIZ
+# Paste this in place of `elif page == "Quiz":` in your app.py.
+# Requires (already defined elsewhere in app.py):
+#   ss, SUBJECTS, DIFFICULTIES, ask_gemini, parse_ai_json,
+#   db_save_score, refresh_data, reset_aiq, reset_pyq, questions_df
+# ══════════════════════════════════════════════════════════════════
+elif page == "Quiz":
+
+    st.header("📝 Quiz")
+
+    quiz_mode = st.radio("Quiz Type", ["AI Quiz", "PYQ Quiz"], horizontal=True, key="quiz_mode_radio")
+
+    # ──────────────────────────────────────────────────────────────
+    # AI QUIZ
+    # ──────────────────────────────────────────────────────────────
+    if quiz_mode == "AI Quiz":
+
+        _aiq = ss("aiq")
+
+        if not _aiq["questions"]:
+            st.subheader("Generate a new AI quiz")
+
+            gen_topic = st.text_input("Topic", key="aiq_topic_inp")
+            gen_subject = st.selectbox("Subject", SUBJECTS, key="aiq_subject_sel")
+            gen_diff = st.selectbox("Difficulty", DIFFICULTIES, key="aiq_diff_sel")
+            gen_count = st.slider("Number of questions", 5, 20, 10, key="aiq_count_sld")
+
+            if st.button("🎯 Generate Quiz", key="aiq_generate_btn"):
+                if not gen_topic.strip():
+                    st.warning("Please enter a topic.")
+                else:
+                    with st.spinner("Generating questions with AI..."):
+                        prompt = f"""
+You are a TNPSC Group 1 question setter.
+Generate exactly {gen_count} multiple-choice questions on the topic
+"{gen_topic.strip()}" (Subject: {gen_subject}, Difficulty: {gen_diff}).
+
+Respond with ONLY a raw JSON array, no markdown fences, no commentary.
+Each item must be an object with EXACTLY these keys:
+"question", "optionA", "optionB", "optionC", "optionD", "answer", "explanation"
+
+"answer" must be exactly one of "A", "B", "C", "D".
+"explanation" should be 1-2 short sentences.
+"""
+                        raw = ask_gemini(prompt)
+                        try:
+                            parsed = parse_ai_json(raw)
+                            _aiq["questions"] = parsed
+                            _aiq["index"] = 0
+                            _aiq["score"] = 0
+                            _aiq["score_saved"] = False
+                            _aiq["topic"] = gen_topic.strip()
+                            _aiq["submitted"] = False
+                            st.rerun()
+                        except ValueError as e:
+                            st.error(f"Couldn't generate a valid quiz: {e}")
+
+        else:
+            qlist = _aiq["questions"]
+            idx = _aiq["index"]
+
+            if idx < len(qlist):
+                q = qlist[idx]
+                st.progress((idx) / len(qlist))
+                st.subheader(f"Question {idx + 1} of {len(qlist)}")
+                st.write(f"**{q['question']}**")
+
+                option_map = {
+                    "A": q["optionA"], "B": q["optionB"],
+                    "C": q["optionC"], "D": q["optionD"],
+                }
+                choice_label = st.radio(
+                    "Select your answer",
+                    [f"{k}. {v}" for k, v in option_map.items()],
+                    key=f"aiq_choice_{idx}",
+                    index=None,
+                )
+
+                if not _aiq["submitted"]:
+                    if st.button("Submit Answer", key=f"aiq_submit_{idx}"):
+                        if choice_label is None:
+                            st.warning("Please select an answer first.")
+                        else:
+                            picked = choice_label.split(".")[0]
+                            _aiq["submitted"] = True
+                            _aiq["last_correct"] = (picked == q["answer"])
+                            if picked == q["answer"]:
+                                _aiq["score"] += 1
+                            st.rerun()
+                else:
+                    if _aiq.get("last_correct"):
+                        st.success("✅ Correct!")
+                    else:
+                        st.error(f"❌ Incorrect. Correct answer: {q['answer']}")
+                    st.info(f"💡 {q.get('explanation', 'No explanation provided.')}")
+
+                    if st.button("Next ➡️", key=f"aiq_next_{idx}"):
+                        _aiq["index"] += 1
+                        _aiq["submitted"] = False
+                        _aiq["last_correct"] = False
+                        st.rerun()
+
+            else:
+                st.subheader("🎉 Quiz Complete!")
+                st.metric("Your Score", f"{_aiq['score']} / {len(qlist)}")
+
+                if not _aiq["score_saved"]:
+                    db_save_score({
+                        "mode": "AI Quiz",
+                        "topic": _aiq["topic"],
+                        "score": _aiq["score"],
+                        "total": len(qlist),
+                    })
+                    _aiq["score_saved"] = True
+                    refresh_data()
+
+                if st.button("🔁 Start a New Quiz", key="aiq_restart_btn"):
+                    reset_aiq()
+                    st.rerun()
+
+    # ──────────────────────────────────────────────────────────────
+    # PYQ QUIZ
+    # ──────────────────────────────────────────────────────────────
+    else:
+        _pyq = ss("pyq")
+
+        if questions_df.empty:
+            st.info("No PYQ questions found in the database yet.")
+        else:
+            if _pyq["data"] is None:
+                st.subheader("Start a PYQ quiz")
+                pyq_subject = st.selectbox(
+                    "Subject", sorted(questions_df["Subject"].dropna().unique()),
+                    key="pyq_subject_sel",
+                )
+                subset = questions_df[questions_df["Subject"] == pyq_subject]
+                max_q = len(subset)
+                pyq_count = st.slider(
+                    "Number of questions", 1, max(max_q, 1), min(10, max_q) or 1,
+                    key="pyq_count_sld",
+                )
+
+                if st.button("▶️ Start Quiz", key="pyq_start_btn"):
+                    sample = subset.sample(n=min(pyq_count, len(subset)), random_state=None)
+                    _pyq["data"] = sample.reset_index(drop=True).to_dict("records")
+                    _pyq["index"] = 0
+                    _pyq["score"] = 0
+                    _pyq["score_saved"] = False
+                    _pyq["subject"] = pyq_subject
+                    _pyq["submitted"] = False
+                    st.rerun()
+
+            else:
+                qlist = _pyq["data"]
+                idx = _pyq["index"]
+
+                if idx < len(qlist):
+                    q = qlist[idx]
+                    st.progress(idx / len(qlist))
+                    st.subheader(f"Question {idx + 1} of {len(qlist)}")
+                    st.write(f"**{q.get('Question', '')}**")
+
+                    option_map = {
+                        "A": q.get("OptionA", ""), "B": q.get("OptionB", ""),
+                        "C": q.get("OptionC", ""), "D": q.get("OptionD", ""),
+                    }
+                    choice_label = st.radio(
+                        "Select your answer",
+                        [f"{k}. {v}" for k, v in option_map.items()],
+                        key=f"pyq_choice_{idx}",
+                        index=None,
+                    )
+
+                    if not _pyq["submitted"]:
+                        if st.button("Submit Answer", key=f"pyq_submit_{idx}"):
+                            if choice_label is None:
+                                st.warning("Please select an answer first.")
+                            else:
+                                picked = choice_label.split(".")[0]
+                                correct_ans = str(q.get("Answer", "A")).strip().upper()
+                                _pyq["submitted"] = True
+                                _pyq["last_correct"] = (picked == correct_ans)
+                                if picked == correct_ans:
+                                    _pyq["score"] += 1
+                                st.rerun()
+                    else:
+                        correct_ans = str(q.get("Answer", "A")).strip().upper()
+                        if _pyq.get("last_correct"):
+                            st.success("✅ Correct!")
+                        else:
+                            st.error(f"❌ Incorrect. Correct answer: {correct_ans}")
+                        st.info(f"💡 {q.get('Explanation', 'No explanation available.')}")
+
+                        if st.button("Next ➡️", key=f"pyq_next_{idx}"):
+                            _pyq["index"] += 1
+                            _pyq["submitted"] = False
+                            _pyq["last_correct"] = False
+                            st.rerun()
+
+                else:
+                    st.subheader("🎉 Quiz Complete!")
+                    st.metric("Your Score", f"{_pyq['score']} / {len(qlist)}")
+
+                    if not _pyq["score_saved"]:
+                        db_save_score({
+                            "mode": "PYQ Quiz",
+                            "topic": _pyq["subject"],
+                            "score": _pyq["score"],
+                            "total": len(qlist),
+                        })
+                        _pyq["score_saved"] = True
+                        refresh_data()
+
+                    if st.button("🔁 Start a New PYQ Quiz", key="pyq_restart_btn"):
+                        reset_pyq()
+                        st.rerun()
+
+    # ══════════════════════════════════════════════════════════════════
 # PAGE: REPORT
+# Paste this in place of `elif page == "Report":` in your app.py.
+# Requires (already defined elsewhere in app.py):
+#   db_get_scores, safe_bar_chart
 # ══════════════════════════════════════════════════════════════════
 elif page == "Report":
 
-    st.header("📊 Performance Report")
+    st.header("📈 Report")
 
-    # ── Study Progress ────────────────────────────────────────────
-    st.subheader("Study Overview")
+    scores = db_get_scores()
 
-    if topics_df.empty:
-        st.warning("No topics yet. Add topics in Study Tracker first.")
+    if not scores:
+        st.info("No quiz attempts yet. Take a quiz to see your report here.")
     else:
-        _tot   = len(topics_df)
-        _comp  = int((topics_df["Status"] == Status.COMPLETED.value).sum())
-        _prog  = int((topics_df["Status"] == Status.IN_PROGRESS.value).sum())
-        _ns    = _tot - _comp - _prog
-        _ratio = _comp / _tot if _tot else 0.0
+        scores_df = pd.DataFrame(scores).drop(columns=["_id", "user_email"], errors="ignore")
+        scores_df = scores_df.sort_values("date", ascending=False)
+        scores_df["Percentage"] = (scores_df["score"] / scores_df["total"] * 100).round(1)
 
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Total Topics",    _tot)
-        m2.metric("✅ Completed",    _comp)
-        m3.metric("🔄 In Progress",  _prog)
-        m4.metric("⏳ Not Started",  _ns)
-        m5.metric("Completion %",    f"{round(_ratio*100,1)}%")
-        st.progress(_ratio)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Quizzes Taken", len(scores_df))
+        c2.metric("Average Score", f"{scores_df['Percentage'].mean():.1f}%")
+        c3.metric("Best Score", f"{scores_df['Percentage'].max():.1f}%")
 
-        # Topics per Subject
-        safe_bar_chart(
-            topics_df.get("Subject", pd.Series(["Unknown"])).fillna("Unknown").value_counts(),
-            ylabel="Topics",
-            title="Topics per Subject",
-        )
+        st.divider()
 
-        # Status Distribution
-        _status_counts = (
-            topics_df["Status"]
-            .apply(lambda v: STATUS_LABELS.get(normalize_status(v), v))
-            .value_counts()
-        )
-        safe_bar_chart(_status_counts, ylabel="Count", title="Study Status Distribution")
+        st.subheader("📊 Score by Topic")
+        topic_avg = scores_df.groupby("topic")["Percentage"].mean().round(1)
+        safe_bar_chart(topic_avg, ylabel="Avg %", title="Average Score by Topic")
 
-        # Subject × Status pivot
-        st.subheader("Subject × Status Breakdown")
-        _pivot = (
-            topics_df
-            .assign(Status=topics_df["Status"].apply(
-                lambda v: STATUS_LABELS.get(normalize_status(v), v)
-            ))
-            .groupby(["Subject", "Status"])
-            .size()
-            .unstack(fill_value=0)
-        )
-        st.dataframe(_pivot, use_container_width=True)
+        st.subheader("📊 Score by Quiz Mode")
+        mode_avg = scores_df.groupby("mode")["Percentage"].mean().round(1)
+        safe_bar_chart(mode_avg, ylabel="Avg %", title="Average Score by Quiz Mode")
 
-        # Difficulty Distribution
-        safe_bar_chart(
-            topics_df["Difficulty"].fillna("Unknown").value_counts(),
-            ylabel="Topics",
-            title="Topics by Difficulty",
-        )
+        st.divider()
 
-        # Weak area detector
-        st.subheader("⚠️ Weak Areas (Not Started + Easy topics)")
-        _weak = topics_df[
-            (topics_df["Status"] == Status.NOT_STARTED.value) &
-            (topics_df["Difficulty"] == "Easy")
-        ][["Subject", "Topic", "Difficulty"]].reset_index(drop=True)
-        if _weak.empty:
-            st.success("No easy topics left unstarted — great job!")
-        else:
-            st.dataframe(_weak, use_container_width=True, hide_index=True)
-
-    # ── Quiz Score History ────────────────────────────────────────
-    st.divider()
-    st.subheader("🏆 Quiz Score History")
-
-    _scores_raw = db_get_scores()
-    if not _scores_raw:
-        st.info("No quiz scores recorded yet. Complete a quiz to see results here.")
-    else:
-        _sdf = pd.DataFrame(_scores_raw).drop(columns=["_id"], errors="ignore")
-        _sdf["date"] = pd.to_datetime(_sdf["date"]).dt.strftime("%d %b %Y  %H:%M")
-
-        # Summary stats
-        _sa1, _sa2, _sa3 = st.columns(3)
-        _sa1.metric("Total Quizzes Taken", len(_sdf))
-        _sa2.metric("Average Score %",     f"{round(_sdf['percentage'].mean(), 1)}%")
-        _sa3.metric("Best Score %",        f"{round(_sdf['percentage'].max(), 1)}%")
-
-        # Score trend chart
-        _sdf_sorted = _sdf.sort_values("date")
-        safe_bar_chart(
-            _sdf_sorted.reset_index(drop=True)["percentage"].rename("Score %"),
-            ylabel="Score %",
-            title="Quiz Score Trend (chronological)",
-        )
-
-        # Full table
-        _cols = [c for c in ["date", "type", "topic", "subject", "score", "total", "percentage"]
-                 if c in _sdf.columns]
-        st.dataframe(
-            _sdf[_cols].sort_values("date", ascending=False),
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.subheader("🕑 Quiz History")
+        _display = scores_df[["date", "mode", "topic", "score", "total", "Percentage"]].copy()
+        _display["date"] = pd.to_datetime(_display["date"]).dt.strftime("%Y-%m-%d %H:%M")
+        st.dataframe(_display, use_container_width=True, hide_index=True)

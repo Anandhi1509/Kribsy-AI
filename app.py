@@ -15,15 +15,6 @@ from google import genai
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-def get_login_url():
-    flow = get_flow()
-    auth_url, _ = flow.authorization_url(
-        prompt="consent",
-        access_type="offline"
-    )
-
-    st.write(auth_url)   # TEMPORARY
-    return auth_url
 
 # ══════════════════════════════════════════════════════════════════
 # 0. PAGE CONFIG  – must be the very first Streamlit command, and
@@ -53,7 +44,14 @@ def get_flow():
 
 def get_login_url():
     flow = get_flow()
-    auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+
+    auth_url, _ = flow.authorization_url(
+        prompt="consent",
+        access_type="offline"
+    )
+
+    st.write(auth_url)
+
     return auth_url
 
 

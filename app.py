@@ -15,10 +15,10 @@ from google import genai
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-
 # ══════════════════════════════════════════════════════════════════
 # 0. PAGE CONFIG  – must be the very first Streamlit command, and
-#    must be called EXACTLY ONCE. 
+#    must be called EXACTLY ONCE. (Your original code called this
+#    twice, which raises a StreamlitAPIException.)
 # ══════════════════════════════════════════════════════════════════
 st.set_page_config(page_title="TNPSC PrepAI", page_icon="📚", layout="wide")
 
@@ -44,13 +44,17 @@ def get_flow():
 
 def get_login_url():
     flow = get_flow()
+    auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
 
-    auth_url, _ = flow.authorization_url(
-        prompt="consent",
-        access_type="offline"
-    )
-
-    st.write(auth_url)
+    # CRITICAL: PKCE requires the SAME Flow instance (with its
+    # code_verifier) to be used both when generating this auth_url
+    # AND when later exchanging the code for tokens. Since Streamlit
+    # reruns the whole script on every interaction, a fresh Flow()
+    # would normally be created each time — losing the code_verifier
+    # and causing fetch_token() to silently fail (looks like an
+    # infinite "sign in" loop). Persisting it in session_state fixes
+    # this.
+    st.session_state["_oauth_flow"] = flow
 
     return auth_url
 
@@ -62,7 +66,7 @@ def login_with_code(code: str) -> dict:
     identity (email, name, picture). This is what should be stored
     in session_state — never the raw JWT string.
     """
-    flow = get_flow()
+    flow = st.session_state.get("_oauth_flow") or get_flow()
     flow.fetch_token(code=code)
     creds = flow.credentials
 
@@ -92,22 +96,6 @@ if "user" not in st.session_state:
 if st.session_state.user is None:
 
     st.title("🔐 Login Required")
-
-    auth_url = get_login_url()
-
-    st.markdown(f"""
-        <a href="{auth_url}" target="_self">
-            <button style="
-                background-color:#4285F4;
-                color:white;
-                padding:10px 20px;
-                border:none;
-                border-radius:5px;
-                font-size:16px;">
-                Sign in with Google
-            </button>
-        </a>
-    """, unsafe_allow_html=True)
 
     params = st.query_params
 
@@ -148,6 +136,23 @@ if st.session_state.user is None:
         except Exception as e:
             st.error(f"Login failed: {e}")
             st.stop()
+
+    else:
+        auth_url = get_login_url()
+
+        st.markdown(f"""
+            <a href="{auth_url}" target="_self">
+                <button style="
+                    background-color:#4285F4;
+                    color:white;
+                    padding:10px 20px;
+                    border:none;
+                    border-radius:5px;
+                    font-size:16px;">
+                    Sign in with Google
+                </button>
+            </a>
+        """, unsafe_allow_html=True)
 
     st.stop()
 
@@ -601,6 +606,7 @@ elif page == "Subjects":
                 )
                 st.dataframe(_display, use_container_width=True, hide_index=True)
 
+
 # ══════════════════════════════════════════════════════════════════
 # PAGE: STUDY TRACKER
 # ══════════════════════════════════════════════════════════════════
@@ -664,10 +670,10 @@ elif page == "Study Tracker":
 
 # ══════════════════════════════════════════════════════════════════
 # PAGE: QUIZ
-# Paste this in place of `elif page == "Quiz":` in your app.py.
-# Requires (already defined elsewhere in app.py):
-#   ss, SUBJECTS, DIFFICULTIES, ask_gemini, parse_ai_json,
-#   db_save_score, refresh_data, reset_aiq, reset_pyq, questions_df
+# Two modes: AI-generated quiz (Gemini) and PYQ quiz (from the
+# shared "questions" collection). Both write to quiz_scores via
+# db_save_score(), which auto-tags the score with the logged-in
+# user's email.
 # ══════════════════════════════════════════════════════════════════
 elif page == "Quiz":
 
@@ -880,11 +886,11 @@ Each item must be an object with EXACTLY these keys:
                         reset_pyq()
                         st.rerun()
 
-    # ══════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════
 # PAGE: REPORT
-# Paste this in place of `elif page == "Report":` in your app.py.
-# Requires (already defined elsewhere in app.py):
-#   db_get_scores, safe_bar_chart
+# Shows only the logged-in user's quiz history (db_get_scores()
+# already filters by CURRENT_USER_EMAIL).
 # ══════════════════════════════════════════════════════════════════
 elif page == "Report":
 

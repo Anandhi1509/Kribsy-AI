@@ -25,37 +25,42 @@ st.set_page_config(page_title="TNPSC PrepAI", page_icon="📚", layout="wide")
 
 # ══════════════════════════════════════════════════════════════════
 # 1. GOOGLE OAUTH HELPERS
+#    NOTE: autogenerate_code_verifier=False disables PKCE. PKCE
+#    requires the exact same Flow object (with its code_verifier) to
+#    be reused both when building the login link AND when exchanging
+#    the code for tokens. But the redirect to Google and back is a
+#    full browser page reload — and Streamlit does not reliably keep
+#    session_state alive across that kind of reload. That mismatch
+#    was causing the "loops back to sign-in" bug. Since this OAuth
+#    Client has a client_secret (confidential web app), PKCE isn't
+#    required, and a brand-new Flow object can safely exchange the
+#    code with zero dependency on prior session state.
 # ══════════════════════════════════════════════════════════════════
+import os
+os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
+os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"  # allows http://localhost during local testing only
+
 def get_flow():
-    return Flow.from_client_config(
+    flow = Flow.from_client_config(
         {
             "web": {
                 "client_id": st.secrets["google"]["client_id"],
                 "client_secret": st.secrets["google"]["client_secret"],
                 "auth_uri": "https://accounts.google.com/o/oauth2/v2/auth",
                 "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [st.secrets["google"]["redirect_uri"]],
+                "redirect_uris": [st.secrets["google"]["oauth_redirect_url"]],
             }
         },
         scopes=["openid", "email", "profile"],
-        redirect_uri=st.secrets["google"]["redirect_uri"],
+        redirect_uri=st.secrets["google"]["oauth_redirect_url"],
+        autogenerate_code_verifier=False,
     )
+    return flow
 
 
 def get_login_url():
     flow = get_flow()
     auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
-
-    # CRITICAL: PKCE requires the SAME Flow instance (with its
-    # code_verifier) to be used both when generating this auth_url
-    # AND when later exchanging the code for tokens. Since Streamlit
-    # reruns the whole script on every interaction, a fresh Flow()
-    # would normally be created each time — losing the code_verifier
-    # and causing fetch_token() to silently fail (looks like an
-    # infinite "sign in" loop). Persisting it in session_state fixes
-    # this.
-    st.session_state["_oauth_flow"] = flow
-
     return auth_url
 
 
@@ -66,7 +71,10 @@ def login_with_code(code: str) -> dict:
     identity (email, name, picture). This is what should be stored
     in session_state — never the raw JWT string.
     """
-    flow = st.session_state.get("_oauth_flow") or get_flow()
+    if isinstance(code, list):
+        code = code[0]
+
+    flow = get_flow()
     flow.fetch_token(code=code)
     creds = flow.credentials
 
@@ -92,18 +100,22 @@ if "user" not in st.session_state:
 
 # ══════════════════════════════════════════════════════════════════
 # 3. LOGIN FLOW
+#    The "code" query param is read and processed FIRST, before any
+#    login-page UI is built — so nothing can regenerate or interfere
+#    with state needed to process the callback.
 # ══════════════════════════════════════════════════════════════════
 if st.session_state.user is None:
 
-    st.title("🔐 Login Required")
-
     params = st.query_params
+    code = params.get("code")
 
-    if "code" in params:
+    if code:
+        st.title("🔐 Logging you in...")
         try:
-            user_info = login_with_code(params["code"])
+            user_info = login_with_code(code)
 
             if not user_info.get("email"):
+                st.query_params.clear()
                 st.error("Login failed: Google did not return an email address.")
                 st.stop()
 
@@ -134,10 +146,15 @@ if st.session_state.user is None:
             st.rerun()
 
         except Exception as e:
-            st.error(f"Login failed: {e}")
-            st.stop()
+            st.query_params.clear()
+            st.error(f"Login failed: {type(e).__name__}: {e}")
+            with st.expander("🔍 Full error details (for debugging)"):
+                import traceback
+                st.code(traceback.format_exc())
+            st.info("Please click 'Sign in with Google' below and try again.")
 
-    else:
+    if st.session_state.user is None:
+        st.title("🔐 Login Required")
         auth_url = get_login_url()
 
         st.markdown(f"""
@@ -154,7 +171,9 @@ if st.session_state.user is None:
             </a>
         """, unsafe_allow_html=True)
 
-    st.stop()
+        st.stop()
+
+
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -571,7 +590,6 @@ TOPIC: {_dash["last_prompt"]}
         else:
             _dash["ai_error"] = True
             st.error("AI is busy or failed. Click Retry above.")
-
 
 # ══════════════════════════════════════════════════════════════════
 # PAGE: SUBJECTS

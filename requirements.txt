@@ -5,4 +5,5 @@ google-genai
 pymongo
 google-auth
 google-auth-oauthlib
+authlib
 

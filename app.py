@@ -38,7 +38,10 @@ st.set_page_config(page_title="TNPSC PrepAI", page_icon="📚", layout="wide")
 # ══════════════════════════════════════════════════════════════════
 import os
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
-os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"  # allows http://localhost during local testing only
+if "localhost" not in st.secrets.get("google", {}).get("oauth_redirect_url", ""):
+    pass  # deployed https — do NOT set insecure transport
+else:
+    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"  # localhost only
 
 def get_flow():
     flow = Flow.from_client_config(

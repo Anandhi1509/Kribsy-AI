@@ -32,7 +32,7 @@ st.set_page_config(page_title="TNPSC PrepAI", page_icon="📚", layout="wide")
 if not st.user.get("is_logged_in", False):
     st.title("🔐 Login Required")
     st.markdown("Welcome to **Kribsy AI** — TNPSC Smart Preparation Assistant.")
-    st.button("Sign in with Google", on_click=st.login, args=("google",))
+    st.button("Sign in with Google", on_click=st.login)
     st.stop()
 
 # ── User is logged in ─────────────────────────────────────────────

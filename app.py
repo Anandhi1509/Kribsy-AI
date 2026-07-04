@@ -29,7 +29,7 @@ st.set_page_config(page_title="TNPSC PrepAI", page_icon="📚", layout="wide")
 #    server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"
 #    client_kwargs = {scope = "openid email profile"}
 # ══════════════════════════════════════════════════════════════════
-if not st.user.is_logged_in:
+if not st.user.get("is_logged_in", False):
     st.title("🔐 Login Required")
     st.markdown("Welcome to **Kribsy AI** — TNPSC Smart Preparation Assistant.")
     st.button("Sign in with Google", on_click=st.login, args=("google",))

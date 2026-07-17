@@ -549,7 +549,7 @@ elif page == "Quiz":
                 else:
                     with st.spinner("Generating questions with AI..."):
                         prompt = f"""
-You are a TNPSC Group 1 question setter.
+You are a TNPSC Group exams question setter.
 Generate exactly {gen_count} multiple-choice questions on the topic
 "{gen_topic.strip()}" (Subject: {gen_subject}, Difficulty: {gen_diff}).
 

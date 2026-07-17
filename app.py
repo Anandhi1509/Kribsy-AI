@@ -31,7 +31,7 @@ st.set_page_config(page_title="TNPSC PrepAI", page_icon="📚", layout="wide")
 # ══════════════════════════════════════════════════════════════════
 if not st.user.get("is_logged_in", False):
     st.title("🔐 Login Required")
-    st.markdown("Welcome to **Kribsy AI** — TNPSC Smart Preparation Assistant.")
+    st.markdown("Welcome to **Kribsy** — Smart Study Management with AI Powered Learning For TNPSC.")
     st.button("Sign in with Google", on_click=st.login)
     st.stop()
 
@@ -364,7 +364,7 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════
 if page == "Dashboard":
 
-    st.title("📚 Kribsy AI – TNPSC Smart Preparation Assistant")
+    st.title("📚 Kribsy-Smart Study Management with AI Powered Learning For TNPSC")
     st.info(
         "AI-powered TNPSC preparation: track topics, generate quizzes, "
         "practice PYQs, and get AI explanations — all in one place."
